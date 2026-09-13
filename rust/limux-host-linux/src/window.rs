@@ -4365,29 +4365,31 @@ fn set_workspace_favorite_visual(workspace: &Workspace) {
     }
 }
 
-/// Find an active rename Entry in the sidebar (if any).
-fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
-    fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
-        if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-            return Some(entry.clone());
-        }
-        let mut child = widget.first_child();
-        while let Some(c) = child {
-            if let Some(entry) = find_entry(&c) {
-                return Some(entry);
-            }
-            child = c.next_sibling();
-        }
-        None
+fn find_rename_entry_in_widget(widget: &gtk::Widget) -> Option<gtk::Entry> {
+    if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+        return Some(entry.clone());
     }
-    let mut row = sidebar_list.first_child();
-    while let Some(r) = row {
-        if let Some(entry) = find_entry(&r) {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(entry) = find_rename_entry_in_widget(&c) {
             return Some(entry);
         }
-        row = r.next_sibling();
+        child = c.next_sibling();
     }
     None
+}
+
+/// Find an active rename Entry in the sidebar (if any).
+fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
+    find_rename_entry_in_widget(sidebar_list.upcast_ref())
+}
+
+fn should_trigger_workspace_double_click_rename(
+    n_press: i32,
+    has_active_rename_entry: bool,
+    clicked_favorite_button: bool,
+) -> bool {
+    n_press == 2 && !has_active_rename_entry && !clicked_favorite_button
 }
 
 fn commit_inline_rename_for_click(
@@ -4819,14 +4821,51 @@ fn install_workspace_row_interactions(
     row: &gtk::ListBoxRow,
     favorite_button: &gtk::Button,
 ) {
+    let left_click = gtk::GestureClick::new();
+    left_click.set_button(1);
+    {
+        let state = state.clone();
+        let workspace_id = workspace_id.to_string();
+        let r = row.clone();
+        let fav_btn = favorite_button.clone();
+        left_click.connect_pressed(move |gesture, n_press, x, y| {
+            let has_active_rename_entry = find_rename_entry_in_widget(r.upcast_ref()).is_some();
+            if has_active_rename_entry {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            let clicked_favorite_button = r
+                .translate_coordinates(&fav_btn, x, y)
+                .is_some_and(|(bx, by)| fav_btn.contains(bx, by));
+            if should_trigger_workspace_double_click_rename(
+                n_press,
+                has_active_rename_entry,
+                clicked_favorite_button,
+            ) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let state = state.clone();
+                let workspace_id = workspace_id.clone();
+                glib::idle_add_local_once(move || {
+                    begin_workspace_inline_rename(&state, &workspace_id);
+                });
+            }
+        });
+    }
+    row.add_controller(left_click);
+
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
     {
         let state = state.clone();
         let workspace_id = workspace_id.to_string();
         let r = row.clone();
-        right_click.connect_pressed(move |_, _, _, _| {
+        right_click.connect_pressed(move |gesture, _, _, _| {
+            if find_rename_entry_in_widget(r.upcast_ref()).is_some() {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             show_workspace_context_menu(&state, &workspace_id, &r);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
         });
     }
     row.add_controller(right_click);
@@ -4850,7 +4889,11 @@ fn install_workspace_row_interactions(
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     {
         let workspace_id = workspace_id.to_string();
+        let r = row.clone();
         drag_source.connect_prepare(move |_, _, _| {
+            if find_rename_entry_in_widget(r.upcast_ref()).is_some() {
+                return None;
+            }
             let payload = glib::Value::from(&workspace_id);
             Some(gtk::gdk::ContentProvider::for_value(&payload))
         });
@@ -7888,7 +7931,8 @@ mod tests {
         resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        should_emit_desktop_notification, should_trigger_workspace_double_click_rename,
+        tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_autostart_dialog_dismisses,
         workspace_drop_layout_path, workspace_folder_path_from_input,
         workspace_notification_message, workspace_path_visible, Direction, EditableCaptureContext,
@@ -8941,5 +8985,22 @@ mod tests {
             left_pane.clone().upcast::<gtk4::Widget>(),
             "find_leaf_pane should descend through a Paned to its leaf"
         );
+    }
+
+    #[test]
+    fn workspace_double_click_rename_guards_against_single_click_active_rename_and_favorite_button()
+    {
+        assert!(should_trigger_workspace_double_click_rename(
+            2, false, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            1, false, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            2, true, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            2, false, true
+        ));
     }
 }
