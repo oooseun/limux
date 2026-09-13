@@ -2506,6 +2506,50 @@ fn build_tab_button_from_label(
     }
     tab_btn.add_controller(click);
 
+    let middle_click = gtk::GestureClick::new();
+    middle_click.set_button(2);
+    {
+        let tab_button = tab_btn.clone();
+        let tab_state = internals.tab_state.clone();
+        middle_click.connect_pressed(move |gesture, _, _, _| {
+            if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+    }
+    {
+        let tab_id = tab_id.to_string();
+        let tab_strip = internals.tab_strip.clone();
+        let content_stack = internals.content_stack.clone();
+        let tab_state = internals.tab_state.clone();
+        let callbacks = internals.callbacks.clone();
+        let pane_outer = internals.pane_outer.clone();
+        let tab_button = tab_btn.clone();
+        middle_click.connect_released(move |_, _, x, y| {
+            let is_renaming = tab_rename_active(&tab_state);
+            let inside_bounds = tab_button.contains(x, y);
+            let is_pinned = tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|entry| entry.id == tab_id && entry.pinned);
+            if can_middle_click_close_tab(is_pinned, is_renaming, inside_bounds) {
+                remove_tab(
+                    &tab_strip,
+                    &content_stack,
+                    &tab_state,
+                    &tab_id,
+                    &callbacks,
+                    &pane_outer,
+                    PaneEmptyReason::ClosedLastTab,
+                );
+            }
+        });
+    }
+    tab_btn.add_controller(middle_click);
+
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
     {
@@ -2615,6 +2659,10 @@ fn build_tab_button_from_label(
     }
 
     (tab_btn, unread_dot)
+}
+
+fn can_middle_click_close_tab(is_pinned: bool, is_renaming: bool, inside_bounds: bool) -> bool {
+    !is_pinned && !is_renaming && inside_bounds
 }
 
 fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextMenuContext) {
@@ -4219,15 +4267,15 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolved_link_destination, select_terminal_commands, select_terminal_tab,
-        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
-        ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
-        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
-        TAB_RENAME_ENTRY_CSS_CLASSES,
+        can_middle_click_close_tab, classify_content_drop_zone, content_drop_preview_rect,
+        display_terminal_title, effective_drop_target_dimensions, is_localhost_input,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, resolved_link_destination,
+        select_terminal_commands, select_terminal_tab, surface_hint_matches,
+        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -4639,5 +4687,13 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn middle_click_tab_close_guards_against_pinned_renaming_and_outside_release() {
+        assert!(can_middle_click_close_tab(false, false, true));
+        assert!(!can_middle_click_close_tab(true, false, true));
+        assert!(!can_middle_click_close_tab(false, true, true));
+        assert!(!can_middle_click_close_tab(false, false, false));
     }
 }
