@@ -53,6 +53,8 @@ struct Workspace {
     notify_label: gtk::Label,
     /// Unread state for notifications without a tab target.
     unread: bool,
+    /// Explicitly marked unread via user context menu action.
+    manual_unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
     /// Last known working directory from the terminal (via OSC 7).
@@ -2104,7 +2106,7 @@ pub fn build_window(app: &adw::Application) {
                 .active_workspace()
                 .map(|workspace| workspace.id.clone());
             if let Some(workspace_id) = workspace_id {
-                clear_visible_tab_unread(&state, &workspace_id);
+                clear_visible_tab_unread_on_window_focus(&state, &workspace_id);
             }
         });
     }
@@ -4081,6 +4083,21 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    let is_unread = {
+        let app_state = state.borrow();
+        let ws_unread = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .is_some_and(|workspace| workspace.unread);
+        has_unread(ws_unread, pane::workspace_has_unread_tabs(workspace_id))
+    };
+    let unread_btn = gtk::Button::with_label(if is_unread {
+        "Mark as Read"
+    } else {
+        "Mark as Unread"
+    });
+    unread_btn.add_css_class("flat");
     let new_tab_btn = gtk::Button::with_label("New tab from workspace directory");
     new_tab_btn.add_css_class("flat");
     let rename_btn = gtk::Button::with_label("Rename");
@@ -4103,6 +4120,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
+    menu_box.append(&unread_btn);
     menu_box.append(&new_tab_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
@@ -4112,6 +4130,44 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     popover.set_child(Some(&menu_box));
     popover.set_parent(row);
     popover.set_position(gtk::PositionType::Right);
+
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        unread_btn.connect_clicked(move |_| {
+            pop.popdown();
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            glib::idle_add_local_once(move || {
+                let root = {
+                    let mut app_state = state.borrow_mut();
+                    let Some(workspace) = app_state
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == ws_id)
+                    else {
+                        return;
+                    };
+                    if is_unread {
+                        workspace.unread = false;
+                        workspace.manual_unread = false;
+                    } else {
+                        workspace.unread = true;
+                        workspace.manual_unread = true;
+                    }
+                    workspace.root.clone()
+                };
+                if is_unread {
+                    pane::clear_all_tabs_unread_in_root(&root);
+                } else {
+                    pane::mark_active_tab_manual_unread_in_root(&root);
+                }
+                sync_workspace_unread(&state, &ws_id);
+                request_session_save(&state);
+            });
+        });
+    }
 
     {
         let state = state.clone();
@@ -4783,6 +4839,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_dot,
             notify_label,
             unread: false,
+            manual_unread: false,
             favorite: false,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -4848,6 +4905,8 @@ fn install_workspace_row_interactions(
                 glib::idle_add_local_once(move || {
                     begin_workspace_inline_rename(&state, &workspace_id);
                 });
+            } else if n_press == 1 && !clicked_favorite_button {
+                clear_visible_tab_unread(&state, &workspace_id);
             }
         });
     }
@@ -6204,6 +6263,7 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         notify_dot,
         notify_label,
         unread: false,
+        manual_unread: false,
         favorite: workspace.favorite,
         cwd,
         folder_path: workspace.folder_path.clone(),
@@ -6381,6 +6441,13 @@ pub(crate) fn create_pane_for_workspace(
             move || request_session_save(&state)
         }),
         on_unread_changed: Box::new(move || {
+            if !pane::workspace_has_unread_tabs(&ws_id_unread) {
+                let mut s = state_for_unread.borrow_mut();
+                if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == ws_id_unread) {
+                    ws.unread = false;
+                    ws.manual_unread = false;
+                }
+            }
             sync_workspace_unread(&state_for_unread, &ws_id_unread);
         }),
         is_pane_visible: Box::new(move |pane_widget| {
@@ -7711,9 +7778,32 @@ fn clear_visible_tab_unread(state: &State, ws_id: &str) {
             return;
         };
         workspace.unread = false;
+        workspace.manual_unread = false;
         workspace.root.clone()
     };
     pane::clear_active_tab_unread_in_root(&root);
+    sync_workspace_unread(state, ws_id);
+}
+
+fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
+    let root = {
+        let mut s = state.borrow_mut();
+        if !s.window.is_active() {
+            return;
+        }
+        let Some(workspace) = s
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == ws_id)
+        else {
+            return;
+        };
+        if !workspace.manual_unread {
+            workspace.unread = false;
+        }
+        workspace.root.clone()
+    };
+    pane::clear_active_tab_unread_in_root_if_not_manual(&root);
     sync_workspace_unread(state, ws_id);
 }
 

@@ -867,12 +867,20 @@ pub fn set_tab_pinned_in_pane(pane_widget: &gtk::Widget, tab_id: &str, pinned: b
 }
 
 fn set_tab_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    if !unread {
+        entry.manual_unread = false;
+    }
     if entry.unread == unread {
         return false;
     }
     entry.unread = unread;
     entry.unread_dot.set_visible(unread);
     true
+}
+
+fn set_tab_manual_unread(entry: &mut TabEntry, unread: bool) -> bool {
+    entry.manual_unread = unread;
+    set_tab_unread(entry, unread)
 }
 
 fn clear_tab_unread(tab_state: &Rc<RefCell<TabState>>, tab_id: &str) -> bool {
@@ -1028,6 +1036,7 @@ struct TabEntry {
     custom_name: Option<String>,
     pinned: bool,
     unread: bool,
+    manual_unread: bool,
     kind: TabKind,
 }
 
@@ -1575,6 +1584,7 @@ fn add_terminal_tab_inner(
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
@@ -1753,6 +1763,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Browser {
                 state: BrowserTabState {
                     uri: saved_uri.clone(),
@@ -1828,6 +1839,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
                 .map(|value| value.pinned)
                 .unwrap_or(false),
             unread: false,
+            manual_unread: false,
             kind: TabKind::Keybinds,
         });
     }
@@ -2180,6 +2192,62 @@ pub fn clear_active_tab_unread_in_root(root: &gtk::Widget) -> bool {
         let active_tab = internals.tab_state.borrow().active_tab.clone();
         if let Some(tab_id) = active_tab {
             changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn clear_active_tab_unread_in_root_if_not_manual(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals.tab_state.borrow().active_tab.clone();
+        if let Some(tab_id) = active_tab {
+            let is_manual = internals
+                .tab_state
+                .borrow()
+                .tabs
+                .iter()
+                .any(|entry| entry.id == tab_id && entry.manual_unread);
+            if !is_manual {
+                changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+            }
+        }
+    }
+    changed
+}
+
+pub fn clear_all_tabs_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let tab_ids: Vec<String> = internals
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .filter(|entry| entry.unread)
+            .map(|entry| entry.id.clone())
+            .collect();
+        for tab_id in tab_ids {
+            changed |= clear_tab_unread(&internals.tab_state, &tab_id);
+        }
+    }
+    changed
+}
+
+pub fn mark_active_tab_manual_unread_in_root(root: &gtk::Widget) -> bool {
+    let mut changed = false;
+    for internals in pane_internals_for_root(root) {
+        let active_tab = internals
+            .tab_state
+            .borrow()
+            .active_tab
+            .clone()
+            .or_else(|| internals.tab_state.borrow().tabs.first().map(|e| e.id.clone()));
+        if let Some(tab_id) = active_tab {
+            if let Some(entry) = internals.tab_state.borrow_mut().find_tab_mut(&tab_id) {
+                changed |= set_tab_manual_unread(entry, true);
+                break;
+            }
         }
     }
     changed
@@ -2673,6 +2741,43 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    // Mark as Unread / Read
+    let is_unread = context
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|e| e.id == tab_id && e.unread);
+    let unread_label = if is_unread {
+        "Mark as Read"
+    } else {
+        "Mark as Unread"
+    };
+    let unread_btn = gtk::Button::with_label(unread_label);
+    unread_btn.add_css_class("flat");
+    {
+        let state = context.tab_state.clone();
+        let tid = tab_id.to_string();
+        let menu_ref = menu.clone();
+        let callbacks = context.callbacks.clone();
+        unread_btn.connect_clicked(move |_| {
+            menu_ref.popdown();
+            let state = state.clone();
+            let tid = tid.clone();
+            let callbacks = callbacks.clone();
+            glib::idle_add_local_once(move || {
+                let mut changed = false;
+                if let Some(entry) = state.borrow_mut().find_tab_mut(&tid) {
+                    changed = set_tab_manual_unread(entry, !is_unread);
+                }
+                if changed {
+                    (callbacks.on_unread_changed)();
+                    (callbacks.on_state_changed)();
+                }
+            });
+        });
+    }
+
     // Rename
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
@@ -2755,6 +2860,7 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         });
     }
 
+    menu_box.append(&unread_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&pin_btn);
     menu_box.append(&close_btn);
@@ -3995,8 +4101,24 @@ fn create_browser_widget(
 ) -> (gtk::Widget, String, BrowserHandles) {
     use webkit6::prelude::*;
 
-    // Use a NetworkSession to avoid sandbox issues
+    // Use a NetworkSession with persistent cookie storage synced from Chrome
     let network_session = webkit6::NetworkSession::default();
+    if let Some(ref session) = network_session {
+        if let Some(cookie_manager) = session.cookie_manager() {
+            if let Some(data_dir) = dirs::data_dir() {
+                let cookie_file = data_dir.join("limux/cookies.txt");
+                if let Some(home) = dirs::home_dir() {
+                    let helper = home.join(".local/bin/limux-sync-chrome-cookies");
+                    if helper.exists() {
+                        let _ = std::process::Command::new(helper).status();
+                    }
+                }
+                if let Some(path_str) = cookie_file.to_str() {
+                    cookie_manager.set_persistent_storage(path_str, webkit6::CookiePersistentStorage::Text);
+                }
+            }
+        }
+    }
     let web_context = webkit6::WebContext::default();
     let user_content_manager = webkit6::UserContentManager::new();
     let dom_editable = Rc::new(Cell::new(false));
@@ -4023,11 +4145,14 @@ fn create_browser_widget(
         );
     }
 
-    let webview = webkit6::WebView::builder()
+    let mut webview_builder = webkit6::WebView::builder()
         .user_content_manager(&user_content_manager)
         .hexpand(true)
-        .vexpand(true)
-        .build();
+        .vexpand(true);
+    if let Some(ref session) = network_session {
+        webview_builder = webview_builder.network_session(session);
+    }
+    let webview = webview_builder.build();
     webview.add_css_class(BROWSER_WEB_VIEW_CSS_CLASS);
     webview.set_halign(gtk::Align::Fill);
     webview.set_valign(gtk::Align::Fill);
