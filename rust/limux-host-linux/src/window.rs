@@ -2293,6 +2293,10 @@ pub fn build_window(app: &adw::Application) {
 
     window.present();
 
+    // Realize every restored tab so background agents come back on their own.
+    // Without this, a restored session stays dead until its tab is clicked.
+    schedule_startup_eager_restore(&state);
+
     // Ask the compositor for server-side decorations when it supports the
     // KDE server-decoration protocol (see the header-bar decision above).
     // libadwaita marks the window client-decorated, which makes GtkWindow
@@ -6588,6 +6592,134 @@ fn close_workspace_by_id_internal(
     if persist {
         request_session_save(state);
     }
+}
+
+/// One tab that the startup sweep still has to realize.
+struct EagerRestoreStep {
+    workspace_idx: usize,
+    pane: gtk::Widget,
+    tab_id: String,
+}
+
+/// Interval between sweep steps. One GTK frame is enough for the stack to map
+/// the child and for `GtkGLArea::realize` to fire, which is what actually
+/// creates the Ghostty surface and forks the PTY.
+const EAGER_RESTORE_STEP_MS: u64 = 90;
+
+/// Kick off the startup eager-restore sweep shortly after the window appears.
+///
+/// Limux restores tabs lazily: a tab's PTY is not created until GTK realizes
+/// its `GtkGLArea`, and a stack only realizes its visible child. A restored
+/// agent sitting in a background tab therefore stays dead until the user
+/// clicks it, which is why session recovery previously required an external
+/// script to crawl workspaces over the control socket — and, for background
+/// tabs it could not reach, to split panes and type `cli --resume` into them.
+/// That produced duplicate sessions, presence-lock collisions and permanent
+/// layout damage. Doing the sweep in-process removes the need for all of it.
+///
+/// Set `LIMUX_EAGER_RESTORE=0` to opt out.
+fn schedule_startup_eager_restore(state: &State) {
+    if matches!(std::env::var("LIMUX_EAGER_RESTORE").as_deref(), Ok("0")) {
+        eprintln!("limux: startup eager restore disabled via LIMUX_EAGER_RESTORE=0");
+        return;
+    }
+
+    let state = state.clone();
+    // Let the first frame settle so the initial workspace finishes mapping
+    // before we start switching the stack underneath it.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+        run_startup_eager_restore(&state);
+    });
+}
+
+fn run_startup_eager_restore(state: &State) {
+    let original_idx = state.borrow().active_idx;
+
+    let mut steps: Vec<EagerRestoreStep> = Vec::new();
+    // Per-pane selection captured up front, so the sweep is invisible: every
+    // pane ends on the tab the user left it on.
+    let mut restore: Vec<(gtk::Widget, String)> = Vec::new();
+    {
+        let app_state = state.borrow();
+        for (workspace_idx, workspace) in app_state.workspaces.iter().enumerate() {
+            for pane in workspace.split_container.panes() {
+                let tab_ids = pane::tab_ids_in_pane(&pane);
+                if tab_ids.is_empty() {
+                    continue;
+                }
+                let active = pane::active_tab_id_in_pane(&pane);
+                for tab_id in tab_ids {
+                    // The active tab realizes with its workspace; visiting the
+                    // workspace at all is what it needs.
+                    if active.as_deref() == Some(tab_id.as_str()) {
+                        continue;
+                    }
+                    steps.push(EagerRestoreStep {
+                        workspace_idx,
+                        pane: pane.clone(),
+                        tab_id,
+                    });
+                }
+                if let Some(active) = active {
+                    restore.push((pane.clone(), active));
+                }
+            }
+            // Guarantee at least one visit per workspace, so single-tab panes
+            // in never-opened workspaces still spawn their agents.
+            if !steps
+                .iter()
+                .any(|step| step.workspace_idx == workspace_idx)
+            {
+                if let Some(pane) = workspace.split_container.panes().into_iter().next() {
+                    if let Some(active) = pane::active_tab_id_in_pane(&pane) {
+                        steps.push(EagerRestoreStep {
+                            workspace_idx,
+                            pane,
+                            tab_id: active,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if steps.is_empty() {
+        return;
+    }
+
+    let total = steps.len();
+    eprintln!("limux: startup eager restore sweeping {total} tabs");
+
+    let steps = Rc::new(steps);
+    let restore = Rc::new(restore);
+    let cursor = Rc::new(Cell::new(0usize));
+    let state = state.clone();
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(EAGER_RESTORE_STEP_MS),
+        move || {
+            let index = cursor.get();
+
+            if index >= steps.len() {
+                for (pane, tab_id) in restore.iter() {
+                    pane::activate_tab_in_pane(pane, tab_id);
+                }
+                select_workspace_by_index(&state, original_idx);
+                eprintln!("limux: startup eager restore complete ({total} tabs)");
+                return glib::ControlFlow::Break;
+            }
+
+            let step = &steps[index];
+            let current_idx = state.borrow().active_idx;
+            if current_idx != step.workspace_idx {
+                select_workspace_by_index(&state, step.workspace_idx);
+            }
+            pane::activate_tab_in_pane(&step.pane, &step.tab_id);
+
+            cursor.set(index + 1);
+            glib::ControlFlow::Continue
+        },
+    );
 }
 
 /// Select a workspace by index and sync the sidebar selection.
