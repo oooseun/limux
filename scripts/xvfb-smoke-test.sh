@@ -380,13 +380,25 @@ cargo test --locked $CARGO_FLAGS -p limux-host-linux shutdown_uses_the_terminal_
   -- --ignored --test-threads=1 --nocapture >"$LOG_DIR/terminal-gl-context.txt" 2>&1 \
   || { cat "$LOG_DIR/terminal-gl-context.txt"; exit 1; }
 cat "$LOG_DIR/terminal-gl-context.txt"
+timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux shutdown_with_pending_terminal_messages \
+  -- --ignored --test-threads=1 --nocapture >"$LOG_DIR/terminal-shutdown-backpressure.txt" 2>&1 \
+  || { cat "$LOG_DIR/terminal-shutdown-backpressure.txt"; exit 1; }
 if [ "$GRAPHICS" = hardware ] && ! grep -Fq 'terminal GL: ' "$LOG_DIR/terminal-gl-context.txt"; then
   echo "FAIL: hardware regression did not report its terminal GL context"
   exit 1
 fi
 for regression in \
+  pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
+  pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
+  pane::tests::closing_the_active_tab_maps_only_its_replacement \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
-  settings_editor::tests::interface_controls_restore_effective_values_after_save_failure; do
+  settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
+  window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
+  terminal::tests::submenu_popovers_never_grab \
+  terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
+  window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
+  window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
+  window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique; do
   cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done

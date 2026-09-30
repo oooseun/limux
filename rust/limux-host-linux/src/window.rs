@@ -1495,7 +1495,7 @@ const BASE_CSS: &str = r#"
     font-weight: 600;
 }
 .limux-indicator-unread-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 7px;
     margin-right: 4px;
 }
@@ -1609,7 +1609,7 @@ const BASE_CSS: &str = r#"
     margin: 0;
 }
 .limux-notify-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 8px;
     margin-right: 6px;
 }
@@ -1623,14 +1623,18 @@ const BASE_CSS: &str = r#"
     font-size: 11px;
 }
 .limux-notify-msg-unread {
-    color: alpha(@accent_bg_color, 0.85);
+    color: alpha(#f59e0b, 0.9);
     font-size: 11px;
 }
 .limux-sidebar-row-unread {
-    background-color: alpha(@accent_bg_color, 0.1);
-    border-left: 3px solid @accent_bg_color;
+    background-color: alpha(#f59e0b, 0.14);
+    border-left: 3px solid #f59e0b;
     border-radius: 8px;
     margin-left: 3px;
+}
+.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {
+    background: alpha(#f59e0b, 0.18);
+    border-left: 3px solid #f59e0b;
 }
 .limux-sidebar-row-unread .limux-ws-name {
     color: @window_fg_color;
@@ -2038,6 +2042,9 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_drag_area);
     sidebar.append(&sidebar_header_handle);
     sidebar.append(&sidebar_scroll);
+    let ssh_button = gtk::Button::with_label("Connect via SSH…");
+    ssh_button.set_tooltip_text(Some("Open an SSH connection in a new workspace"));
+    sidebar.append(&ssh_button);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
 
@@ -2096,6 +2103,17 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    {
+        let state = state.clone();
+        ssh_button.connect_clicked(move |_| {
+            let state = state.clone();
+            let parent = state.borrow().window.clone();
+            crate::ssh_dialog::show(&parent, move |target| {
+                connect_ssh_target(&state, target);
+            });
+        });
+    }
 
     install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
 
@@ -2308,7 +2326,10 @@ pub fn build_window(app: &adw::Application) {
                     state.borrow_mut().session_store = Err(format!(
                         "{error}. A safe startup snapshot could not be read: {retry_error}"
                     ));
-                    apply_loaded_session(&state, layout_state::load_session());
+                    // No store, nothing is saved: dedup in memory only.
+                    let mut loaded = layout_state::load_session();
+                    layout_state::dedup_tab_ids(&mut loaded.state);
+                    apply_loaded_session(&state, loaded);
                 }
             }
         }
@@ -2926,7 +2947,9 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
-    if updated.appearance.ui_scale != previous.appearance.ui_scale {
+    if updated.appearance.ui_scale != previous.appearance.ui_scale
+        || updated.appearance.unread_color != previous.appearance.unread_color
+    {
         reload_app_css(state, updated);
     }
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -2942,7 +2965,9 @@ fn handle_config_change(
     if let Err(err) = app_config::save(updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
-        if updated.appearance.ui_scale != previous.appearance.ui_scale {
+        if updated.appearance.ui_scale != previous.appearance.ui_scale
+            || updated.appearance.unread_color != previous.appearance.unread_color
+        {
             reload_app_css(state, previous);
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -3947,9 +3972,18 @@ fn build_sidebar_row(
     let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_row.append(&notify_dot);
     top_row.append(&name_label);
+
+    let favorite_button = gtk::Button::with_label("\u{2606}");
+    favorite_button.add_css_class("flat");
+    favorite_button.add_css_class("limux-ws-star-btn");
+    favorite_button.set_focus_on_click(false);
+    favorite_button.set_valign(gtk::Align::Center);
+    favorite_button.set_halign(gtk::Align::End);
+    favorite_button.set_tooltip_text(Some("Favorite workspace"));
+    top_row.append(&favorite_button);
     top_row.append(&close_button);
 
-    // Second row: path label on the left, favorite star right-aligned below the X.
+    // Second row: the workspace path, when it is enabled and available.
     let path_label = gtk::Label::builder()
         .xalign(0.0)
         .hexpand(true)
@@ -3964,19 +3998,9 @@ fn build_sidebar_row(
         path_label.set_label("");
     }
 
-    let favorite_button = gtk::Button::with_label("\u{2606}");
-    favorite_button.add_css_class("flat");
-    favorite_button.add_css_class("limux-ws-star-btn");
-    favorite_button.set_focus_on_click(false);
-    favorite_button.set_valign(gtk::Align::Center);
-    favorite_button.set_halign(gtk::Align::End);
-    favorite_button.set_tooltip_text(Some("Favorite workspace"));
-
-    path_label.set_visible(workspace_path_visible(folder_path, show_workspace_path));
-
     let path_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     path_row.append(&path_label);
-    path_row.append(&favorite_button);
+    set_workspace_path_row_visibility(&path_label, folder_path, show_workspace_path);
 
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
@@ -4013,13 +4037,26 @@ fn workspace_path_visible(folder_path: Option<&str>, show_workspace_path: bool) 
     show_workspace_path && folder_path.is_some()
 }
 
+fn set_workspace_path_row_visibility(
+    path_label: &gtk::Label,
+    folder_path: Option<&str>,
+    show_workspace_path: bool,
+) {
+    let visible = workspace_path_visible(folder_path, show_workspace_path);
+    path_label.set_visible(visible);
+    if let Some(path_row) = path_label.parent() {
+        path_row.set_visible(visible);
+    }
+}
+
 fn sync_workspace_path_visibility(state: &State, show_workspace_path: bool) {
     let app_state = state.borrow();
     for workspace in &app_state.workspaces {
-        workspace.path_label.set_visible(workspace_path_visible(
+        set_workspace_path_row_visibility(
+            &workspace.path_label,
             workspace.folder_path.as_deref(),
             show_workspace_path,
-        ));
+        );
     }
 }
 
@@ -4857,6 +4894,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             initial_state: None,
             skip_default_tab: true,
             suppress_initial_autostart: false,
+            initial_command: None,
         },
     );
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
@@ -5629,15 +5667,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 }
             };
 
-            let workspace_name = {
+            let workspace = {
                 let app_state = state.borrow();
                 app_state
                     .workspaces
                     .iter()
                     .find(|workspace| workspace.id == resolved.workspace_id)
-                    .map(|workspace| workspace.name.clone())
+                    .map(|workspace| (workspace.name.clone(), workspace.split_container.clone()))
             };
-            let Some(workspace_name) = workspace_name else {
+            let Some((workspace_name, split_container)) = workspace else {
                 let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
                 return;
             };
@@ -5681,7 +5719,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             }
 
-            let _ = reply.send(Ok(response));
+            // The caller may target the new pane as soon as it has the reply.
+            split_container.after_pending_rebuild(move || {
+                let _ = reply.send(Ok(response));
+            });
         }
         ControlCommand::ListSurfaces { target, reply } => {
             let resolved = {
@@ -6270,7 +6311,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     }
 }
 
+fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
+    let workspace = WorkspaceState {
+        id: None,
+        name: format!("SSH: {}", target.destination()),
+        favorite: false,
+        cwd: None,
+        folder_path: None,
+        autostart_command: None,
+        layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+    };
+    add_workspace_with_initial_command(state, &workspace, Some(target.command()));
+    request_session_save(state);
+}
+
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
+    add_workspace_with_initial_command(state, workspace, None);
+}
+
+fn add_workspace_with_initial_command(
+    state: &State,
+    workspace: &WorkspaceState,
+    initial_command: Option<String>,
+) {
     let shortcuts = {
         let s = state.borrow();
         s.shortcuts.clone()
@@ -6295,14 +6358,35 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         .as_deref()
         .or(workspace.cwd.as_deref());
     let autostart_command = Rc::new(RefCell::new(workspace.autostart_command.clone()));
-    let (root, split_container) = build_workspace_root(
-        state,
-        &shortcuts,
-        &id,
-        working_dir,
-        &autostart_command,
-        &workspace.layout,
-    );
+    let (root, split_container) = if let Some(command) = initial_command {
+        let pane = create_pane_for_workspace(
+            state,
+            &shortcuts,
+            &id,
+            working_dir,
+            autostart_command.clone(),
+            PaneCreationOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                suppress_initial_autostart: true,
+                initial_command: Some(command),
+            },
+        );
+        let container = SplitTreeContainer::new(state, pane.upcast());
+        (
+            container.widget().clone().upcast::<gtk::Widget>(),
+            container,
+        )
+    } else {
+        build_workspace_root(
+            state,
+            &shortcuts,
+            &id,
+            working_dir,
+            &autostart_command,
+            &workspace.layout,
+        )
+    };
     stack.add_named(&root, Some(&stack_name));
 
     let show_workspace_path = state
@@ -6397,6 +6481,7 @@ pub(crate) struct PaneCreationOptions<'a> {
     pub(crate) initial_state: Option<&'a PaneState>,
     pub(crate) skip_default_tab: bool,
     pub(crate) suppress_initial_autostart: bool,
+    pub(crate) initial_command: Option<String>,
 }
 
 pub(crate) fn create_pane_for_workspace(
@@ -6435,6 +6520,7 @@ pub(crate) fn create_pane_for_workspace(
         workspace_id: ws_id.to_string(),
         autostart_command,
         suppress_next_autostart: Cell::new(options.suppress_initial_autostart),
+        initial_command: RefCell::new(options.initial_command),
         on_split: Box::new(move |pane_widget, orientation| {
             split_pane(
                 &state_for_split,
@@ -6628,13 +6714,13 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
-    s.stack.remove(&ws.root);
     s.sidebar_list.remove(&ws.sidebar_row);
     s.indicator_box.remove(&ws.indicator_button);
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
         if persist {
             request_session_save(state);
@@ -6655,13 +6741,20 @@ fn close_workspace_by_id_internal(
     s.active_idx = new_idx;
     sync_indicator_active_state(&s);
 
+    let stack = s.stack.clone();
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
-    s.stack.set_visible_child_name(&stack_name);
-
     let row = s.workspaces[new_idx].sidebar_row.clone();
     let sidebar_list = s.sidebar_list.clone();
     drop(s);
 
+    // Show the new active workspace before hiding the old one: GtkStack maps
+    // its first child the instant the visible child is hidden, so showing
+    // the replacement first keeps that first child from flashing on screen
+    // (see `terminal::detach_after_repaint`). The switch unmaps the old root,
+    // and the crossing event it sends to the terminal under the pointer reads
+    // the state, so it runs without the borrow.
+    stack.set_visible_child_name(&stack_name);
+    crate::terminal::remove_from_stack_after_repaint(&ws.root);
     sidebar_list.select_row(Some(&row));
     apply_top_bar_mode(state);
     if persist {
@@ -7143,6 +7236,7 @@ fn split_pane(
             initial_state: options.initial_state.as_ref(),
             skip_default_tab: options.skip_default_tab || options.inherit_active_directory,
             suppress_initial_autostart: options.suppress_initial_autostart,
+            initial_command: None,
         },
     );
     if options.inherit_active_directory {
@@ -8809,10 +8903,12 @@ mod tests {
     use std::rc::Rc;
 
     use super::glib;
+    use super::gtk;
     use super::gtk::ffi;
     use super::gtk::gdk;
     use super::run_on_gtk_test_thread;
     use super::ToVariant;
+    use gtk::prelude::*;
 
     #[test]
     fn top_bar_visibility_respects_both_preferences_and_fullscreen() {
@@ -9784,6 +9880,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn hidden_workspace_path_does_not_reserve_sidebar_row_height() {
+        gtk::init().expect("initialize GTK");
+        let display = gtk::gdk::Display::default().expect("GTK display");
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&super::build_window_css(1.0));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        let (hidden_path_row, _, _, _, _, path_label, _) =
+            super::build_sidebar_row("Workspace", Some("/workspace"), false);
+        let (no_path_row, ..) = super::build_sidebar_row("Workspace", None, true);
+        let row_height = |row: &gtk::ListBoxRow| row.measure(gtk::Orientation::Vertical, -1).0;
+        let no_path_height = row_height(&no_path_row);
+
+        assert_eq!(
+            row_height(&hidden_path_row),
+            no_path_height,
+            "a hidden path row should take no more space than a workspace without a path"
+        );
+        super::set_workspace_path_row_visibility(&path_label, Some("/workspace"), true);
+        assert!(
+            row_height(&hidden_path_row) > no_path_height,
+            "a visible path should add its own row height"
+        );
+        super::set_workspace_path_row_visibility(&path_label, Some("/workspace"), false);
+        assert_eq!(
+            row_height(&hidden_path_row),
+            no_path_height,
+            "hiding the path again should collapse the row immediately"
+        );
+    }
+
+    #[test]
     fn workspace_folder_path_input_expands_home_and_relative_paths() {
         let home = std::path::Path::new("/home/tester");
         let current = std::path::Path::new("/tmp/current");
@@ -10204,3 +10337,14 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "ssh_launch_tests.rs"]
+mod ssh_launch_tests;
+
+#[cfg(test)]
+#[path = "tab_move_tests.rs"]
+mod tab_move_tests;
+
+#[cfg(test)]
+#[path = "pane_create_tests.rs"]
+mod pane_create_tests;

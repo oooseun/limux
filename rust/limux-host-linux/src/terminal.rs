@@ -74,6 +74,9 @@ const LINK_PREVIEW_CURSOR_Y_GAP: i32 = 14;
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
+    // Embedded Ghostty borrows config.command; keep its allocation alive until
+    // after ghostty_surface_free, just like the callback userdata below.
+    _startup_command: Option<CString>,
     identity: SurfaceIdentity,
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
@@ -1412,6 +1415,90 @@ fn free_terminal_surface(
     drop(entry);
 }
 
+/// Hide `widget`, then run `detach` once its window has painted a frame
+/// without it.
+///
+/// Unrealizing a GLArea whose last frame the renderer still holds makes GTK
+/// copy that frame back to the CPU (`gdk_gl_texture_release`). On NVIDIA the
+/// copy can segfault inside the driver, and when GTK shares the frame as a
+/// dmabuf it also leaks the copy. After one frame without the widget,
+/// unrealize just deletes the textures. An unrealized widget is in no frame
+/// and is detached at once. An unmapped one still waits: the last frame may
+/// show it from before an ancestor was hidden or its workspace switched away.
+pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() + 'static) {
+    let Some(clock) = widget.frame_clock() else {
+        detach();
+        return;
+    };
+    widget.set_visible(false);
+
+    let detach = Rc::new(RefCell::new(Some(detach)));
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let finish = {
+        let clock = clock.clone();
+        let handler = handler.clone();
+        let timeout = timeout.clone();
+        move || {
+            let id = handler.borrow_mut().take();
+            if let Some(id) = id {
+                clock.disconnect(id);
+            }
+            let source = timeout.borrow_mut().take();
+            if let Some(source) = source {
+                source.remove();
+            }
+            let detach = detach.borrow_mut().take();
+            if let Some(detach) = detach {
+                detach();
+            }
+        }
+    };
+    // A frame already under way may have been painted before the hide.
+    let hidden_at = clock.frame_counter();
+    let on_paint = finish.clone();
+    let id = clock.connect_after_paint(move |clock| {
+        if clock.frame_counter() > hidden_at {
+            on_paint();
+        }
+    });
+    *handler.borrow_mut() = Some(id);
+    // Hiding an unmapped widget queues no frame of its own.
+    clock.request_phase(gtk::gdk::FrameClockPhase::AFTER_PAINT);
+    // A minimized window stops painting after at most one more frame. Below
+    // the redraw priority: when a busy main loop makes both due at once, the
+    // pending paint goes first.
+    let source =
+        glib::timeout_add_local_full(Duration::from_millis(100), glib::Priority::DEFAULT_IDLE, {
+            let timeout = timeout.clone();
+            move || {
+                // Firing: the source ends on its own, nothing is left to remove.
+                timeout.borrow_mut().take();
+                finish();
+                glib::ControlFlow::Break
+            }
+        });
+    *timeout.borrow_mut() = Some(source);
+}
+
+/// Remove `widget` from its `gtk::Stack` once its window has painted a frame
+/// without it (see [`detach_after_repaint`]).
+pub(crate) fn remove_from_stack_after_repaint(widget: &gtk::Widget) {
+    let child = widget.clone();
+    detach_after_repaint(widget, move || remove_from_stack(&child));
+}
+
+/// Remove `widget` from the `gtk::Stack` it is in, if any. The stack is looked
+/// up when this runs: a tab moved between panes changes stacks meanwhile.
+pub(crate) fn remove_from_stack(widget: &gtk::Widget) {
+    if let Some(stack) = widget
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Stack>().ok())
+    {
+        stack.remove(widget);
+    }
+}
+
 /// Create a new Ghostty-powered terminal widget.
 /// Returns an Overlay (GLArea + toast layer) for embedding in the pane.
 pub fn create_terminal(
@@ -1526,10 +1613,23 @@ pub fn create_terminal(
     {
         let surface_cell = surface_cell.clone();
         let handler = gl_area.connect_map(move |gl_area| {
+            gl_area.set_auto_render(true);
             if let Some(surface) = *surface_cell.borrow() {
+                unsafe { ghostty_surface_set_occlusion(surface, true) };
                 refresh_surface_display(surface, gl_area);
             } else {
                 gl_area.queue_render();
+            }
+        });
+        track_signal(&signal_handlers, &gl_area, handler);
+    }
+
+    {
+        let surface_cell = surface_cell.clone();
+        let handler = gl_area.connect_unmap(move |gl_area| {
+            gl_area.set_auto_render(false);
+            if let Some(surface) = *surface_cell.borrow() {
+                unsafe { ghostty_surface_set_occlusion(surface, false) };
             }
         });
         track_signal(&signal_handlers, &gl_area, handler);
@@ -1724,6 +1824,7 @@ pub fn create_terminal(
                 map.borrow_mut().insert(
                     surface_key,
                     SurfaceEntry {
+                        _startup_command: c_startup_command,
                         identity: surface_identity,
                         gl_area: gl.clone(),
                         toast_overlay: overlay_for_map.clone(),
@@ -2292,6 +2393,11 @@ fn build_submenu_button(label: &str, popover: &gtk::Popover) -> gtk::MenuButton 
     button.set_halign(gtk::Align::Fill);
     button.set_popover(Some(popover));
     button.add_css_class("flat");
+    // Hover opens this submenu, so it must never take a GTK grab: an autohide
+    // popover swallows the next click to dismiss itself, which turns every
+    // item below the submenu into a two-click item. The parent menu closes it
+    // on `closed`, and sibling items close it on hover.
+    popover.set_autohide(false);
 
     let weak_button = button.downgrade();
     let motion = gtk::EventControllerMotion::new();
@@ -2424,6 +2530,14 @@ fn show_terminal_context_menu(
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
             lbl.set_xalign(0.0);
         }
+        let motion = gtk::EventControllerMotion::new();
+        let ids_pop = ids_popover.clone();
+        let open_in_pop = open_in_popover.clone();
+        motion.connect_enter(move |_, _, _| {
+            ids_pop.popdown();
+            open_in_pop.popdown();
+        });
+        btn.add_controller(motion);
         menu_box.append(&btn);
     }
 
@@ -2598,7 +2712,7 @@ fn translate_key_event(
     let consumed = key_event
         .map(translate_consumed_mods)
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
-    let keycode = ghostty_keycode_with_caps_escape_remap(keyval, keycode);
+    let keycode = ghostty_keycode_with_keyval_remap(keyval, keycode);
 
     ghostty_input_key_s {
         action,
@@ -2608,20 +2722,61 @@ fn translate_key_event(
         text: ptr::null(),
         unshifted_codepoint: unshifted,
         composing: false,
+        key: ghostty_key_for_keyval(keyval),
     }
 }
 
-fn ghostty_keycode_with_caps_escape_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
+fn ghostty_keycode_with_keyval_remap(keyval: gtk::gdk::Key, keycode: u32) -> u32 {
     const XKB_KEYCODE_ESCAPE: u32 = 9;
     const XKB_KEYCODE_CAPS_LOCK: u32 = 66;
 
-    // Embedded Ghostty derives its key from the XKB keycode and cannot see GTK's remapped keyval.
-    if keyval == gtk::gdk::Key::Escape {
-        XKB_KEYCODE_ESCAPE
-    } else if keyval == gtk::gdk::Key::Caps_Lock {
-        XKB_KEYCODE_CAPS_LOCK
-    } else {
-        keycode
+    match keyval {
+        gtk::gdk::Key::Escape => XKB_KEYCODE_ESCAPE,
+        gtk::gdk::Key::Caps_Lock => XKB_KEYCODE_CAPS_LOCK,
+        _ => keycode,
+    }
+}
+
+/// Keypad keyvals as Ghostty keys, matching Ghostty's GTK apprt.
+///
+/// Embedded Ghostty derives its key from the XKB keycode, so with Num Lock off
+/// keypad 1 (`KP_End`) would still resolve to `numpad_1`. Passing the keyval's
+/// key keeps keypad identity (`numpad_end`) for `kp_*` keybinds and Kitty
+/// keyboard sequences while still producing navigation.
+fn ghostty_key_for_keyval(keyval: gtk::gdk::Key) -> c_int {
+    use gtk::gdk::Key;
+
+    match keyval {
+        Key::KP_0 => GHOSTTY_KEY_NUMPAD_0,
+        Key::KP_1 => GHOSTTY_KEY_NUMPAD_1,
+        Key::KP_2 => GHOSTTY_KEY_NUMPAD_2,
+        Key::KP_3 => GHOSTTY_KEY_NUMPAD_3,
+        Key::KP_4 => GHOSTTY_KEY_NUMPAD_4,
+        Key::KP_5 => GHOSTTY_KEY_NUMPAD_5,
+        Key::KP_6 => GHOSTTY_KEY_NUMPAD_6,
+        Key::KP_7 => GHOSTTY_KEY_NUMPAD_7,
+        Key::KP_8 => GHOSTTY_KEY_NUMPAD_8,
+        Key::KP_9 => GHOSTTY_KEY_NUMPAD_9,
+        Key::KP_Decimal => GHOSTTY_KEY_NUMPAD_DECIMAL,
+        Key::KP_Divide => GHOSTTY_KEY_NUMPAD_DIVIDE,
+        Key::KP_Multiply => GHOSTTY_KEY_NUMPAD_MULTIPLY,
+        Key::KP_Subtract => GHOSTTY_KEY_NUMPAD_SUBTRACT,
+        Key::KP_Add => GHOSTTY_KEY_NUMPAD_ADD,
+        Key::KP_Enter => GHOSTTY_KEY_NUMPAD_ENTER,
+        Key::KP_Equal => GHOSTTY_KEY_NUMPAD_EQUAL,
+        Key::KP_Separator => GHOSTTY_KEY_NUMPAD_SEPARATOR,
+        Key::KP_Left => GHOSTTY_KEY_NUMPAD_LEFT,
+        Key::KP_Right => GHOSTTY_KEY_NUMPAD_RIGHT,
+        Key::KP_Up => GHOSTTY_KEY_NUMPAD_UP,
+        Key::KP_Down => GHOSTTY_KEY_NUMPAD_DOWN,
+        Key::KP_Page_Up => GHOSTTY_KEY_NUMPAD_PAGE_UP,
+        Key::KP_Page_Down => GHOSTTY_KEY_NUMPAD_PAGE_DOWN,
+        Key::KP_Home => GHOSTTY_KEY_NUMPAD_HOME,
+        Key::KP_End => GHOSTTY_KEY_NUMPAD_END,
+        Key::KP_Insert => GHOSTTY_KEY_NUMPAD_INSERT,
+        Key::KP_Delete => GHOSTTY_KEY_NUMPAD_DELETE,
+        Key::KP_Begin => GHOSTTY_KEY_NUMPAD_BEGIN,
+        _ => GHOSTTY_KEY_UNIDENTIFIED,
     }
 }
 
@@ -2878,6 +3033,193 @@ mod tests {
         unsafe { std::ffi::CStr::from_ptr(value.cast()) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn submenu_popovers_never_grab() {
+        gtk::init().expect("GTK display required");
+        let popover = gtk::Popover::new();
+        assert!(
+            popover.is_autohide(),
+            "GTK still defaults submenus to a grab"
+        );
+        let button = build_submenu_button("IDs", &popover);
+        // A grabbing submenu spends the next click dismissing itself, which
+        // makes every context-menu item below it need two clicks.
+        assert!(!popover.is_autohide());
+        assert_eq!(button.popover().as_ref(), Some(&popover));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn detach_after_repaint_waits_for_a_frame_without_the_widget() {
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+
+        // A widget in no frame is detached at once.
+        let loose = gtk::Label::new(None);
+        let detached = Rc::new(Cell::new(false));
+        detach_after_repaint(loose.upcast_ref(), {
+            let detached = detached.clone();
+            move || detached.set(true)
+        });
+        assert!(detached.get());
+
+        let shown = gtk::Label::new(Some("frame"));
+        let window = gtk::Window::builder().child(&shown).build();
+        window.present();
+        let clock = shown
+            .frame_clock()
+            .expect("presented widget has a frame clock");
+        let wait_for_paint_of = |widget: &gtk::Widget| {
+            let painted = Rc::new(Cell::new(false));
+            let id = clock.connect_after_paint({
+                let painted = painted.clone();
+                let widget = widget.clone();
+                move |_| painted.set(painted.get() || widget.is_mapped())
+            });
+            while !painted.get() {
+                context.iteration(true);
+            }
+            clock.disconnect(id);
+        };
+        let detach_and_wait = |widget: &gtk::Widget| {
+            let hidden_at = clock.frame_counter();
+            let detached_at = Rc::new(Cell::new(None));
+            detach_after_repaint(widget, {
+                let clock = clock.clone();
+                let detached_at = detached_at.clone();
+                move || detached_at.set(Some(clock.frame_counter()))
+            });
+            assert!(!widget.is_visible());
+            assert_eq!(detached_at.get(), None);
+            while detached_at.get().is_none() {
+                context.iteration(true);
+            }
+            (hidden_at, detached_at.get().unwrap())
+        };
+
+        wait_for_paint_of(shown.upcast_ref());
+        let (hidden_at, detached_at) = detach_and_wait(shown.upcast_ref());
+        assert!(
+            detached_at > hidden_at,
+            "detached before a frame without the widget was painted"
+        );
+
+        // Unmapped because its parent was just hidden, it is still in the last
+        // frame, so it waits for a newer one too.
+        let inner = gtk::Label::new(Some("inner"));
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        outer.append(&inner);
+        window.set_child(Some(&outer));
+        wait_for_paint_of(inner.upcast_ref());
+        outer.set_visible(false);
+        assert!(!inner.is_mapped());
+        let (hidden_at, detached_at) = detach_and_wait(inner.upcast_ref());
+        assert!(
+            detached_at > hidden_at,
+            "detached an unmapped widget the last frame still showed"
+        );
+
+        // Hidden mid-frame, the frame under way may already hold the widget,
+        // so detaching waits for the next one. The tick keeps frames coming.
+        let midframe = gtk::Label::new(Some("mid-frame"));
+        window.set_child(Some(&midframe));
+        let hidden_at = Rc::new(Cell::new(None));
+        let detached_at = Rc::new(Cell::new(None));
+        let tick = window.add_tick_callback({
+            let hidden_at = hidden_at.clone();
+            let detached_at = detached_at.clone();
+            move |_, clock| {
+                if hidden_at.get().is_none() && midframe.is_mapped() {
+                    hidden_at.set(Some(clock.frame_counter()));
+                    let detached_at = detached_at.clone();
+                    let clock = clock.clone();
+                    detach_after_repaint(midframe.upcast_ref(), move || {
+                        detached_at.set(Some(clock.frame_counter()))
+                    });
+                }
+                glib::ControlFlow::Continue
+            }
+        });
+        while detached_at.get().is_none() {
+            context.iteration(true);
+        }
+        tick.remove();
+        assert!(
+            detached_at.get() > hidden_at.get(),
+            "detached in the frame it was hidden in"
+        );
+
+        // A main loop kept busy past the fallback delay still paints the
+        // frame without the widget before detaching it.
+        let busy = gtk::Label::new(Some("busy"));
+        window.set_child(Some(&busy));
+        wait_for_paint_of(busy.upcast_ref());
+        let hidden_at = clock.frame_counter();
+        let detached_at = Rc::new(Cell::new(None));
+        detach_after_repaint(busy.upcast_ref(), {
+            let clock = clock.clone();
+            let detached_at = detached_at.clone();
+            move || detached_at.set(Some(clock.frame_counter()))
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        while detached_at.get().is_none() {
+            context.iteration(true);
+        }
+        assert!(
+            detached_at.get().unwrap() > hidden_at,
+            "the fallback detached before a pending paint"
+        );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display and Ghostty resources"]
+    fn shutdown_with_pending_terminal_messages() {
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        init_ghostty();
+
+        let terminal = create_terminal(
+            Some("/tmp"),
+            TerminalOptions {
+                startup_command: Some(
+                    "/bin/sh -c 'printf \"FLOOD_READY\\n\"; i=0; while [ $i -lt 256 ]; do printf \"\\033]2;busy\\007\"; i=$((i+1)); done; sleep 30'"
+                        .to_string(),
+                ),
+                ..TerminalOptions::default()
+            },
+            TerminalCallbacks::disconnected(),
+        );
+        let window = gtk::Window::builder()
+            .default_width(640)
+            .default_height(480)
+            .child(&terminal.root)
+            .build();
+        window.present();
+        assert!(terminal.handle.surface_cell.borrow().is_some());
+
+        // Do not iterate the main context: the reader must encounter app
+        // mailbox backpressure before shutdown joins it on this thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal
+            .handle
+            .read_viewport_text()
+            .is_some_and(|text| text.contains("FLOOD_READY"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        eprintln!("closing terminal with pending title updates");
+        terminal.handle.shutdown();
+        assert!(terminal.handle.surface_cell.borrow().is_none());
+        window.close();
     }
 
     #[test]
@@ -3178,6 +3520,61 @@ mod tests {
         assert_eq!(caps_as_escape.keycode, 9);
         assert_eq!(escape_as_caps.keycode, 66);
         assert_eq!(writing_key.keycode, 38);
+    }
+
+    #[test]
+    fn keypad_navigation_keeps_keypad_identity() {
+        let modifiers = gtk::gdk::ModifierType::empty();
+        for (keyval, physical, key) in [
+            (gtk::gdk::Key::KP_Home, 79, GHOSTTY_KEY_NUMPAD_HOME),
+            (gtk::gdk::Key::KP_Up, 80, GHOSTTY_KEY_NUMPAD_UP),
+            (gtk::gdk::Key::KP_Page_Up, 81, GHOSTTY_KEY_NUMPAD_PAGE_UP),
+            (gtk::gdk::Key::KP_Left, 83, GHOSTTY_KEY_NUMPAD_LEFT),
+            (gtk::gdk::Key::KP_Begin, 84, GHOSTTY_KEY_NUMPAD_BEGIN),
+            (gtk::gdk::Key::KP_Right, 85, GHOSTTY_KEY_NUMPAD_RIGHT),
+            (gtk::gdk::Key::KP_End, 87, GHOSTTY_KEY_NUMPAD_END),
+            (gtk::gdk::Key::KP_Down, 88, GHOSTTY_KEY_NUMPAD_DOWN),
+            (
+                gtk::gdk::Key::KP_Page_Down,
+                89,
+                GHOSTTY_KEY_NUMPAD_PAGE_DOWN,
+            ),
+            (gtk::gdk::Key::KP_Insert, 90, GHOSTTY_KEY_NUMPAD_INSERT),
+            (gtk::gdk::Key::KP_Delete, 91, GHOSTTY_KEY_NUMPAD_DELETE),
+        ] {
+            let event = translate_key_event(
+                GHOSTTY_ACTION_PRESS,
+                None,
+                None,
+                keyval,
+                physical,
+                modifiers,
+            );
+            assert_eq!(event.keycode, physical, "{keyval:?}");
+            assert_eq!(event.key, key, "{keyval:?}");
+        }
+
+        let digit = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::KP_1,
+            87,
+            modifiers,
+        );
+        assert_eq!(digit.keycode, 87);
+        assert_eq!(digit.key, GHOSTTY_KEY_NUMPAD_1);
+
+        let regular_end = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            None,
+            None,
+            gtk::gdk::Key::End,
+            115,
+            modifiers,
+        );
+        assert_eq!(regular_end.keycode, 115);
+        assert_eq!(regular_end.key, GHOSTTY_KEY_UNIDENTIFIED);
     }
 
     #[test]

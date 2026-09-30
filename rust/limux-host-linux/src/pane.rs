@@ -22,7 +22,7 @@ use webkit6::prelude::*;
 use crate::app_config::{AppConfig, LinkOpenDestination};
 use crate::keybind_editor;
 use crate::layout_state::{
-    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+    new_tab_id, PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
 };
 use crate::link_uri;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -193,11 +193,27 @@ pub fn retire_pane(pane_widget: &gtk::Widget) {
             tab_state.active_rename_tab = None;
             std::mem::take(&mut tab_state.tabs)
         };
+        // Contents leave once a frame without the pane has painted: removing
+        // them now would unrealize terminals the last frame still shows (see
+        // `terminal::detach_after_repaint`). The pane is hidden rather than
+        // each content: hiding a stack's visible child makes GtkStack map
+        // another one. A content still in flight into this pane is in another
+        // pane's stack, where the transfer takes it out after its own frame.
+        let mut contents = Vec::with_capacity(entries.len());
         for entry in entries {
             entry.prepare_for_removal();
             internals.tab_strip.remove(&entry.tab_button);
-            internals.content_stack.remove(&entry.content);
+            contents.push(entry.content);
         }
+        let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+        let stack = internals.content_stack.clone();
+        crate::terminal::detach_after_repaint(&pane_widget, move || {
+            for content in contents {
+                if content.parent().as_ref() == Some(stack.upcast_ref()) {
+                    stack.remove(&content);
+                }
+            }
+        });
         unregister_pane(internals.pane_id);
     }
 }
@@ -240,6 +256,8 @@ pub struct PaneCallbacks {
     pub workspace_id: String,
     pub autostart_command: Rc<RefCell<Option<String>>>,
     pub suppress_next_autostart: Cell<bool>,
+    /// Consumed by the first terminal; never serialized or inherited.
+    pub initial_command: RefCell<Option<String>>,
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
@@ -434,7 +452,7 @@ pub const PANE_CSS: &str = r#"
     margin-right: 2px;
 }
 .limux-tab-unread-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 9px;
     margin-right: 2px;
 }
@@ -907,14 +925,7 @@ pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) 
         return false;
     };
 
-    let trimmed = title.trim();
-    if trimmed.is_empty() {
-        entry.custom_name = None;
-        entry.title_label.set_text(entry.kind.default_title());
-    } else {
-        entry.custom_name = Some(trimmed.to_string());
-        entry.title_label.set_text(trimmed);
-    }
+    entry.rename(title);
     true
 }
 
@@ -1171,6 +1182,7 @@ struct TabEntry {
     unread_dot: gtk::Label,
     content: gtk::Widget,
     custom_name: Option<String>,
+    automatic_title: Option<String>,
     pinned: bool,
     unread: bool,
     manual_unread: bool,
@@ -1178,6 +1190,17 @@ struct TabEntry {
 }
 
 impl TabEntry {
+    fn rename(&mut self, title: &str) {
+        let title = title.trim();
+        self.custom_name = (!title.is_empty()).then(|| title.to_string());
+        self.title_label.set_text(
+            self.custom_name
+                .as_deref()
+                .or(self.automatic_title.as_deref())
+                .unwrap_or_else(|| self.kind.default_title()),
+        );
+    }
+
     fn prepare_for_removal(&self) {
         match &self.kind {
             TabKind::Terminal { state } => state.handle.shutdown(),
@@ -1216,10 +1239,6 @@ impl TabState {
     fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabEntry> {
         self.tabs.iter_mut().find(|e| e.id == id)
     }
-}
-
-fn next_tab_id() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,15 +1437,16 @@ fn make_terminal_callbacks(
 
     TerminalCallbacks {
         on_title_changed: Box::new(move |title: &str| {
-            let has_custom = state_for_title
-                .borrow()
-                .tabs
-                .iter()
-                .any(|entry| entry.id == tid_for_title && entry.custom_name.is_some());
-            if has_custom || title.is_empty() {
+            if title.is_empty() {
                 return;
             }
             let display = display_terminal_title(title);
+            if let Some(entry) = state_for_title.borrow_mut().find_tab_mut(&tid_for_title) {
+                entry.automatic_title = Some(display.clone());
+                if entry.custom_name.is_some() {
+                    return;
+                }
+            }
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
@@ -1611,7 +1631,7 @@ fn add_terminal_tab_inner(
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
     let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
 
     let term_cwd = Rc::new(RefCell::new(
@@ -1673,7 +1693,12 @@ fn add_terminal_tab_inner(
     }
     let suppress_autostart = internals.callbacks.suppress_next_autostart.replace(false);
     let (startup_command, workspace_autostart_command) = select_terminal_commands(
-        restored_agent_command,
+        internals
+            .callbacks
+            .initial_command
+            .borrow_mut()
+            .take()
+            .or(restored_agent_command),
         internals.callbacks.autostart_command.borrow().clone(),
         suppress_autostart,
     );
@@ -1719,6 +1744,7 @@ fn add_terminal_tab_inner(
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
+            automatic_title: None,
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
             manual_unread: false,
@@ -1874,7 +1900,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
     let saved_uri = Rc::new(RefCell::new(
         options
             .as_ref()
@@ -1901,6 +1927,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
             custom_name: options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
+            automatic_title: Some(title),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             unread: false,
             manual_unread: false,
@@ -1954,7 +1981,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
         .options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
+        .unwrap_or_else(new_tab_id);
 
     let (tab_btn, title_label, unread_dot) = build_tab_button("Keybinds", &tab_id, internals);
 
@@ -1973,6 +2000,7 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
                 .options
                 .as_ref()
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
+            automatic_title: None,
             pinned: input
                 .options
                 .as_ref()
@@ -3289,13 +3317,8 @@ fn show_rename_dialog(
                 return;
             }
             commit.set(true);
-            let new_name = entry.text().to_string();
-            if !new_name.trim().is_empty() {
-                lbl.set_label(&new_name);
-                let mut ts = state.borrow_mut();
-                if let Some(tab) = ts.find_tab_mut(&tid) {
-                    tab.custom_name = Some(new_name);
-                }
+            if let Some(tab) = state.borrow_mut().find_tab_mut(&tid) {
+                tab.rename(&entry.text());
             }
             lbl.set_visible(true);
             if entry.parent().is_some() {
@@ -3555,7 +3578,6 @@ fn transfer_tab_between_panes(
     if source.pane_id == target.pane_id {
         return false;
     }
-
     commit_active_tab_rename(&source.tab_state);
     commit_active_tab_rename(&target.tab_state);
 
@@ -3586,15 +3608,10 @@ fn transfer_tab_between_panes(
     if entry.tab_button.parent().is_some() {
         source.tab_strip.remove(&entry.tab_button);
     }
-    if entry.content.parent().is_some() {
-        source.content_stack.remove(&entry.content);
-    }
 
     rebind_moved_tab_entry(&mut entry, target);
     let moved_tab_id = entry.id.clone();
-    target
-        .content_stack
-        .add_named(&entry.content, Some(&moved_tab_id));
+    let content = entry.content.clone();
 
     {
         let mut target_state = target.tab_state.borrow_mut();
@@ -3602,6 +3619,65 @@ fn transfer_tab_between_panes(
         target_state.tabs.insert(clamped_idx, entry);
     }
     rebuild_tab_strip(&target.tab_strip, &target.tab_state);
+
+    // Activate the source's replacement before the content leaves: GtkStack
+    // maps its first child the instant the visible one is hidden, so this
+    // keeps that first child from flashing on screen once
+    // `detach_after_repaint` below hides `content`.
+    if let Some(next_active) = source_next_active {
+        activate_tab(
+            &source.tab_strip,
+            &source.content_stack,
+            &source.tab_state,
+            &next_active,
+        );
+        clear_tab_unread_if_visible_and_not_manual(
+            &source.tab_state,
+            &next_active,
+            &source.pane_outer.clone().upcast(),
+            &source.callbacks,
+        );
+    }
+
+    // The tab belongs to the target from now on, so closing either pane
+    // before the content arrives treats it as the target's. The content
+    // changes stacks once a frame without it has been painted (see
+    // `terminal::detach_after_repaint`). Connected ahead of `on_empty`, which
+    // tears the source pane down after that same frame.
+    {
+        let target = Rc::clone(target);
+        let moved = content.clone();
+        let tab_id = moved_tab_id.clone();
+        let from = content.parent();
+        crate::terminal::detach_after_repaint(&content, move || {
+            // A later move of the same tab may have placed it already.
+            if moved.parent() == from {
+                crate::terminal::remove_from_stack(&moved);
+            }
+            let (still_here, active) = {
+                let target_state = target.tab_state.borrow();
+                (
+                    target_state.tabs.iter().any(|item| item.id == tab_id),
+                    target_state.active_tab.as_deref() == Some(tab_id.as_str()),
+                )
+            };
+            // Closed, or moved on again, before its content got here; or an
+            // earlier move of the same tab, run in this frame, placed it.
+            if !still_here || moved.parent().is_some() {
+                return;
+            }
+            moved.set_visible(true);
+            target.content_stack.add_named(&moved, Some(&tab_id));
+            if active {
+                activate_tab(
+                    &target.tab_strip,
+                    &target.content_stack,
+                    &target.tab_state,
+                    &tab_id,
+                );
+            }
+        });
+    }
 
     if moved_was_unread {
         (source.callbacks.on_unread_changed)();
@@ -3620,19 +3696,6 @@ fn transfer_tab_between_panes(
         (source.callbacks.on_empty)(
             &source.pane_outer.clone().upcast(),
             PaneEmptyReason::MovedLastTabOut,
-        );
-    } else if let Some(next_active) = source_next_active {
-        activate_tab(
-            &source.tab_strip,
-            &source.content_stack,
-            &source.tab_state,
-            &next_active,
-        );
-        clear_tab_unread_if_visible_and_not_manual(
-            &source.tab_state,
-            &next_active,
-            &source.pane_outer.clone().upcast(),
-            &source.callbacks,
         );
     }
 
@@ -3888,7 +3951,8 @@ fn activate_tab(
         content_stack.set_visible_child_name(tab_id);
     }
 
-    if let Some(target) = focus_target {
+    // Content still on its way from another pane gets focus when it arrives.
+    if let Some(target) = focus_target.filter(|_| has_content_child) {
         // Mouse-initiated tab switches can leave focus on the click target if we
         // refocus synchronously. Deferring to the next idle tick makes the newly
         // active surface or webview the final focus owner.
@@ -3935,9 +3999,9 @@ fn remove_tab(
 
     entry.prepare_for_removal();
     tab_strip.remove(&entry.tab_button);
-    content_stack.remove(&entry.content);
 
     let Some(new_id) = new_id else {
+        crate::terminal::remove_from_stack_after_repaint(&entry.content);
         if removed_was_unread {
             (callbacks.on_unread_changed)();
         }
@@ -3951,6 +4015,10 @@ fn remove_tab(
     };
 
     if was_active {
+        // Activate the replacement before hiding the outgoing widget: GtkStack
+        // maps its first child the instant the visible one is hidden, so
+        // detaching after activation keeps that first child from flashing on
+        // screen (see `terminal::detach_after_repaint`).
         activate_tab(tab_strip, content_stack, tab_state, &new_id);
         clear_tab_unread_if_visible_and_not_manual(
             tab_state,
@@ -3959,6 +4027,7 @@ fn remove_tab(
             callbacks,
         );
     }
+    crate::terminal::remove_from_stack_after_repaint(&entry.content);
     if removed_was_unread {
         (callbacks.on_unread_changed)();
     }
@@ -5118,6 +5187,7 @@ mod tests {
                 workspace_id: "ws-test".to_string(),
                 autostart_command: Rc::new(RefCell::new(None)),
                 suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
                 on_split: Box::new(|_, _| {}),
                 on_close_pane: Box::new(|_| {}),
                 on_bell: Box::new(|_, _, _| {}),
@@ -5156,6 +5226,7 @@ mod tests {
                     title_label: title_label.clone(),
                     unread_dot: unread_dot.clone(),
                     content: gtk::Box::new(gtk::Orientation::Vertical, 0).upcast(),
+                    automatic_title: None,
                     custom_name: None,
                     unread: false,
                     manual_unread: false,
@@ -5235,5 +5306,392 @@ mod tests {
             }
             assert_eq!(unread_changed_count.get(), 2);
         });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn moved_tab_survives_either_pane_closing_before_the_next_frame() {
+        use super::{
+            add_keybind_editor_tab_to_pane, create_pane, find_pane_internals, glib,
+            move_tab_to_pane, retire_pane, tab_title, PaneCallbacks,
+        };
+        use crate::app_config::AppConfig;
+        use gtk::prelude::*;
+        use gtk4 as gtk;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let callbacks = || {
+            let shortcuts = shortcuts.clone();
+            Rc::new(PaneCallbacks {
+                workspace_id: "test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+
+        for close_target in [false, true] {
+            let source = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+            let target = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            row.append(&source);
+            row.append(&target);
+            let window = gtk::Window::builder().child(&row).build();
+            window.present();
+            add_keybind_editor_tab_to_pane(
+                source.upcast_ref(),
+                shortcuts.clone(),
+                Rc::new(|_, _| Err(String::new())),
+            );
+            let source_state = find_pane_internals(source.upcast_ref()).unwrap();
+            let target_state = find_pane_internals(target.upcast_ref()).unwrap();
+            let (tab_id, content) = {
+                let tabs = source_state.tab_state.borrow();
+                (tabs.tabs[0].id.clone(), tabs.tabs[0].content.clone())
+            };
+            while !content.is_mapped() {
+                context.iteration(true);
+            }
+            let source_stack: gtk::Widget = source_state.content_stack.clone().upcast();
+
+            assert!(move_tab_to_pane(
+                source.upcast_ref(),
+                &tab_id,
+                target.upcast_ref()
+            ));
+            assert_eq!(content.parent(), Some(source_stack.clone()));
+            assert!(tab_title(source.upcast_ref(), &tab_id).is_none());
+            assert!(tab_title(target.upcast_ref(), &tab_id).is_some());
+
+            // Closed before the frame that lets the content change stacks.
+            retire_pane(if close_target { &target } else { &source }.upcast_ref());
+            while content.parent().as_ref() == Some(&source_stack) {
+                context.iteration(true);
+            }
+            if close_target {
+                assert_eq!(content.parent(), None, "the tab closed with its pane");
+            } else {
+                assert_eq!(
+                    target_state.content_stack.visible_child(),
+                    Some(content.clone()),
+                    "the tab outlived the pane it left"
+                );
+                assert!(content.is_visible());
+            }
+            window.close();
+        }
+
+        // Moved on twice more before the frame (A->B->C->B): the content
+        // lands in B's stack once.
+        let panes: Vec<gtk::Box> = (0..3)
+            .map(|_| create_pane(callbacks(), shortcuts.clone(), None, None, true))
+            .collect();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        for pane in &panes {
+            row.append(pane);
+        }
+        let window = gtk::Window::builder().child(&row).build();
+        window.present();
+        add_keybind_editor_tab_to_pane(
+            panes[0].upcast_ref(),
+            shortcuts.clone(),
+            Rc::new(|_, _| Err(String::new())),
+        );
+        let states: Vec<_> = panes
+            .iter()
+            .map(|pane| find_pane_internals(pane.upcast_ref()).unwrap())
+            .collect();
+        let (tab_id, content) = {
+            let tabs = states[0].tab_state.borrow();
+            (tabs.tabs[0].id.clone(), tabs.tabs[0].content.clone())
+        };
+        while !content.is_mapped() {
+            context.iteration(true);
+        }
+        let source_stack: gtk::Widget = states[0].content_stack.clone().upcast();
+        for (from, to) in [(0, 1), (1, 2), (2, 1)] {
+            assert!(move_tab_to_pane(
+                panes[from].upcast_ref(),
+                &tab_id,
+                panes[to].upcast_ref()
+            ));
+        }
+        while content.parent().as_ref() == Some(&source_stack) {
+            context.iteration(true);
+        }
+        for _ in 0..3 {
+            context.iteration(false);
+        }
+        assert_eq!(
+            content.parent(),
+            Some(states[1].content_stack.clone().upcast())
+        );
+        assert_eq!(states[1].content_stack.pages().n_items(), 1);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn retired_pane_releases_its_tab_contents_after_a_frame() {
+        use super::{
+            add_keybind_editor_tab_to_pane, create_pane, find_pane_internals, glib,
+            move_tab_to_pane, retire_pane, PaneCallbacks,
+        };
+        use crate::app_config::AppConfig;
+        use gtk::prelude::*;
+        use gtk4 as gtk;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let callbacks = || {
+            let shortcuts = shortcuts.clone();
+            Rc::new(PaneCallbacks {
+                workspace_id: "test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+        let wait_for_release = |content: &gtk::Widget| {
+            let timeout = std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + timeout;
+            // Wakes the blocking iteration below if nothing else does.
+            glib::timeout_add_local_once(timeout, || {});
+            while content.parent().is_some() {
+                if std::time::Instant::now() >= deadline {
+                    panic!("retired pane's content was never released from its stack");
+                }
+                context.iteration(true);
+            }
+        };
+
+        let pane = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+        add_keybind_editor_tab_to_pane(
+            pane.upcast_ref(),
+            shortcuts.clone(),
+            Rc::new(|_, _| Err(String::new())),
+        );
+        let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let content = internals.tab_state.borrow().tabs[0].content.clone();
+        while !content.is_mapped() {
+            context.iteration(true);
+        }
+
+        retire_pane(pane.upcast_ref());
+        assert!(
+            content.parent().is_some(),
+            "content is detached only after a frame without the pane"
+        );
+        wait_for_release(&content);
+        assert_eq!(content.parent(), None);
+        window.close();
+
+        // A tab still in flight into a pane that was never shown, so has no
+        // frame clock: its content, realized in the source's stack, must not
+        // be unrealized by the retire itself.
+        let source = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+        let target = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+        let stack = gtk::Stack::new();
+        stack.add_child(&source);
+        stack.add_child(&target);
+        stack.set_visible_child(&source);
+        let window = gtk::Window::builder().child(&stack).build();
+        window.present();
+        add_keybind_editor_tab_to_pane(
+            source.upcast_ref(),
+            shortcuts.clone(),
+            Rc::new(|_, _| Err(String::new())),
+        );
+        let source_state = find_pane_internals(source.upcast_ref()).unwrap();
+        let (tab_id, content) = {
+            let tabs = source_state.tab_state.borrow();
+            (tabs.tabs[0].id.clone(), tabs.tabs[0].content.clone())
+        };
+        while !content.is_mapped() {
+            context.iteration(true);
+        }
+        assert!(target.frame_clock().is_none());
+        let unrealized = Rc::new(Cell::new(false));
+        content.connect_unrealize({
+            let unrealized = unrealized.clone();
+            move |_| unrealized.set(true)
+        });
+
+        assert!(move_tab_to_pane(
+            source.upcast_ref(),
+            &tab_id,
+            target.upcast_ref()
+        ));
+        retire_pane(target.upcast_ref());
+        assert!(
+            !unrealized.get(),
+            "in-flight content unrealized before a frame without it"
+        );
+        wait_for_release(&content);
+        assert_eq!(content.parent(), None);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn closing_the_active_tab_maps_only_its_replacement() {
+        use super::{close_tab_in_pane, create_pane, find_pane_internals, glib, PaneCallbacks};
+        use crate::app_config::AppConfig;
+        use gtk::prelude::*;
+        use gtk4 as gtk;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        crate::terminal::init_ghostty();
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let callbacks = || {
+            let shortcuts = shortcuts.clone();
+            Rc::new(PaneCallbacks {
+                workspace_id: "test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(|| Rc::new(RefCell::new(AppConfig::default()))),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+
+        let pane = create_pane(callbacks(), shortcuts.clone(), None, None, true);
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+
+        // Three terminal tabs: keybind tabs are one per pane, so this needs a
+        // kind that can repeat.
+        for _ in 0..3 {
+            super::add_terminal_tab_to_pane(pane.upcast_ref());
+        }
+
+        let internals = find_pane_internals(pane.upcast_ref()).unwrap();
+        let (first_content, replacement_id, replacement_content, closed_id, closed_content) = {
+            let tabs = internals.tab_state.borrow();
+            assert_eq!(tabs.tabs.len(), 3, "three terminal tabs");
+            assert_eq!(
+                tabs.active_tab.as_deref(),
+                Some(tabs.tabs[2].id.as_str()),
+                "the last tab added is active"
+            );
+            (
+                tabs.tabs[0].content.clone(),
+                tabs.tabs[1].id.clone(),
+                tabs.tabs[1].content.clone(),
+                tabs.tabs[2].id.clone(),
+                tabs.tabs[2].content.clone(),
+            )
+        };
+        // The first stack child is neither the tab being closed nor its
+        // replacement, matching the reported flash (an unrelated tab briefly
+        // mapped).
+        assert_eq!(
+            internals.content_stack.first_child(),
+            Some(first_content.clone())
+        );
+
+        while !closed_content.is_mapped() {
+            context.iteration(true);
+        }
+
+        let first_maps = Rc::new(Cell::new(0u32));
+        let _first_map_id = first_content.connect_map({
+            let first_maps = first_maps.clone();
+            move |_| first_maps.set(first_maps.get() + 1)
+        });
+        let replacement_maps = Rc::new(Cell::new(0u32));
+        let _replacement_map_id = replacement_content.connect_map({
+            let replacement_maps = replacement_maps.clone();
+            move |_| replacement_maps.set(replacement_maps.get() + 1)
+        });
+
+        assert!(close_tab_in_pane(pane.upcast_ref(), &closed_id));
+
+        // Runs until the closed tab's content has left the stack (see
+        // `terminal::remove_from_stack_after_repaint`).
+        while closed_content.parent().is_some() {
+            context.iteration(true);
+        }
+        for _ in 0..3 {
+            context.iteration(false);
+        }
+
+        assert_eq!(
+            first_maps.get(),
+            0,
+            "an unrelated tab must never be mapped while closing the active tab"
+        );
+        assert!(
+            replacement_maps.get() >= 1,
+            "the replacement tab must become visible"
+        );
+        assert_eq!(
+            internals.content_stack.visible_child_name().as_deref(),
+            Some(replacement_id.as_str())
+        );
+
+        window.close();
     }
 }

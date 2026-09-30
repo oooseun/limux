@@ -121,8 +121,13 @@ echo 'PASS: browser double-click rename and Enter commit'
 
 click_tab 335 2
 xdotool key --clearmodifiers ctrl+a BackSpace Return
+assert_title browser Browser
+echo 'PASS: empty rename restores the default browser title'
+
+click_tab 335 2
+type_name 'Browser renamed'
+xdotool key Return
 assert_title browser 'Browser renamed'
-echo 'PASS: empty rename preserves the current name'
 
 click_tab 245
 xdotool type --clearmodifiers --delay 20 ': # Not a tab name'
@@ -149,6 +154,32 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 [ "$saved" = true ] || { echo 'FAIL: renamed tabs were not persisted'; exit 1; }
+
+# Keep the application title current while a custom name is displayed, then
+# restore it immediately when the rename editor is cleared.
+"$CLI" send --workspace rename --surface 1:terminal "printf '\\033]0;App working\\007'"
+"$CLI" send-key --workspace rename --surface 1:terminal Enter
+sleep 0.5
+assert_title terminal 'Terminal renamed'
+click_tab 245 2
+type_name '   '
+xdotool mousemove --window "$WINDOW" 500 350 click 1
+assert_title terminal 'App working'
+for _ in $(seq 1 50); do
+  jq -e '.workspaces[0].layout.tabs | any(.id == "terminal" and .custom_name == null)' \
+    "$XDG_DATA_HOME/limux/session.json" >/dev/null && break
+  sleep 0.1
+done
+jq -e '.workspaces[0].layout.tabs | any(.id == "terminal" and .custom_name == null)' \
+  "$XDG_DATA_HOME/limux/session.json" >/dev/null \
+  || { echo 'FAIL: cleared custom title was not persisted'; exit 1; }
+"$CLI" send --workspace rename --surface 1:terminal "printf '\\033]0;App idle\\007'"
+"$CLI" send-key --workspace rename --surface 1:terminal Enter
+assert_title terminal 'App idle'
+"$CLI" rename-tab --workspace rename --tab tab:terminal 'Custom again'
+"$CLI" rename-tab --workspace rename --tab tab:terminal ''
+assert_title terminal 'App idle'
+echo 'PASS: blank rename restores the application title, persists, and resumes title updates'
 
 # Zoom detaches the other pane from the visible GTK tree, but its tabs still
 # belong to the workspace and remain valid explicit control targets.
