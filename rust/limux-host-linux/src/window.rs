@@ -8218,10 +8218,18 @@ fn extract_json_arg_bool(
 }
 
 pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool {
-    let mut steps: Vec<(usize, u64, serde_json::Value)> = transcript
-        .lines()
+    let lines: Vec<&str> = transcript.lines().collect();
+    let scan_from = lines
+        .iter()
+        .rposition(|line| line.contains("\"USER_EXPLICIT\"") && line.contains("\"USER_INPUT\""))
+        .map(|idx| idx.saturating_sub(5))
+        .unwrap_or(0);
+
+    let mut steps: Vec<(usize, u64, serde_json::Value)> = lines[scan_from..]
+        .iter()
         .enumerate()
-        .filter_map(|(line_idx, line)| {
+        .filter_map(|(offset, line)| {
+            let line_idx = scan_from + offset;
             let line = line.trim();
             if line.is_empty() {
                 return None;
@@ -8602,12 +8610,6 @@ fn resolve_agent_session_id_for_tab(
     pane_id: u32,
     tab_id: &str,
 ) -> (Option<String>, bool) {
-    let (proc_session_id, proc_live_jetski) =
-        discover_live_jetski_session_for_tab(ws_id, pane_id, tab_id);
-    if proc_session_id.is_some() {
-        return (proc_session_id, true);
-    }
-
     let session_id = pane::tab_agent_session_id_in_workspace(ws_id, pane_id, tab_id).or_else(|| {
         layout_state::RestorableAgentIndex::load()
             .agent_for_surface(ws_id, Some(pane_id), tab_id)
@@ -8620,6 +8622,16 @@ fn resolve_agent_session_id_for_tab(
             || jetski_brain_dir()
                 .is_some_and(|dir| dir.join(sid).join("presence.lock").exists())
     });
+
+    if session_id.is_some() && has_presence_lock {
+        return (session_id, true);
+    }
+
+    let (proc_session_id, proc_live_jetski) =
+        discover_live_jetski_session_for_tab(ws_id, pane_id, tab_id);
+    if proc_session_id.is_some() {
+        return (proc_session_id, true);
+    }
 
     (session_id, proc_live_jetski || has_presence_lock)
 }
