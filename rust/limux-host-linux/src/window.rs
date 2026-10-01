@@ -8512,11 +8512,44 @@ fn jetski_presence_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".gemini/jetski/presence"))
 }
 
+thread_local! {
+    static DISCOVERED_TAB_SESSIONS: RefCell<HashMap<(String, u32, String), (u32, String)>> =
+        RefCell::new(HashMap::new());
+}
+
+fn is_presence_lock_actively_held(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    matches!(
+        file.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
+}
+
+fn sid_has_active_presence_lock(sid: &str) -> bool {
+    jetski_presence_dir()
+        .is_some_and(|dir| is_presence_lock_actively_held(&dir.join(format!("{sid}.lock"))))
+        || jetski_brain_dir()
+            .is_some_and(|dir| is_presence_lock_actively_held(&dir.join(sid).join("presence.lock")))
+}
+
+fn is_pid_running_not_stopped(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let state = stat[rparen + 1..].trim_start().chars().next().unwrap_or('Z');
+    !matches!(state, 'T' | 't' | 'Z' | 'X')
+}
+
 fn discover_live_jetski_session_for_tab(
     workspace_id: &str,
     pane_id: u32,
     tab_id: &str,
-) -> (Option<String>, bool) {
+) -> (Option<(u32, String)>, bool) {
     let tab_needle = format!("LIMUX_TAB_ID={tab_id}\0");
     let surface_needle = format!("LIMUX_SURFACE_ID={pane_id}:{tab_id}\0");
     let ws_needle = format!("LIMUX_WORKSPACE_ID={workspace_id}\0");
@@ -8525,13 +8558,16 @@ fn discover_live_jetski_session_for_tab(
     };
 
     let mut has_live_jetski = false;
-    let mut fallback_db_session: Option<String> = None;
+    let mut fallback_db_session: Option<(u32, String)> = None;
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(pid_str) = file_name.to_str() else {
             continue;
         };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if !is_pid_running_not_stopped(pid) {
             continue;
         }
         let proc_dir = entry.path();
@@ -8567,14 +8603,14 @@ fn discover_live_jetski_session_for_tab(
                 if let Some(rest) = target_str.rsplit_once("/presence/") {
                     if let Some(conv_id) = rest.1.strip_suffix(".lock") {
                         if !conv_id.is_empty() && !conv_id.contains('/') {
-                            return (Some(conv_id.to_string()), true);
+                            return (Some((pid, conv_id.to_string())), true);
                         }
                     }
                 }
                 if let Some(rest) = target_str.split("/.gemini/jetski/brain/").nth(1) {
                     if let Some(conv_id) = rest.strip_suffix("/presence.lock") {
                         if !conv_id.is_empty() && !conv_id.contains('/') {
-                            return (Some(conv_id.to_string()), true);
+                            return (Some((pid, conv_id.to_string())), true);
                         }
                     }
                 }
@@ -8582,7 +8618,7 @@ fn discover_live_jetski_session_for_tab(
                     if let Some(rest) = target_str.rsplit_once("/conversations/") {
                         if let Some(conv_id) = rest.1.strip_suffix(".db") {
                             if !conv_id.is_empty() && !conv_id.contains('/') {
-                                fallback_db_session = Some(conv_id.to_string());
+                                fallback_db_session = Some((pid, conv_id.to_string()));
                                 has_live_jetski = true;
                             }
                         }
@@ -8610,30 +8646,40 @@ fn resolve_agent_session_id_for_tab(
     pane_id: u32,
     tab_id: &str,
 ) -> (Option<String>, bool) {
-    let session_id = pane::tab_agent_session_id_in_workspace(ws_id, pane_id, tab_id).or_else(|| {
-        layout_state::RestorableAgentIndex::load()
-            .agent_for_surface(ws_id, Some(pane_id), tab_id)
-            .map(|agent| agent.session_id)
-    });
-
-    let has_presence_lock = session_id.as_deref().is_some_and(|sid| {
-        jetski_presence_dir()
-            .is_some_and(|dir| dir.join(format!("{sid}.lock")).exists())
-            || jetski_brain_dir()
-                .is_some_and(|dir| dir.join(sid).join("presence.lock").exists())
-    });
-
-    if session_id.is_some() && has_presence_lock {
-        return (session_id, true);
+    let cache_key = (ws_id.to_string(), pane_id, tab_id.to_string());
+    let discovered = DISCOVERED_TAB_SESSIONS.with(|map| map.borrow().get(&cache_key).cloned());
+    if let Some((pid, sid)) = discovered {
+        if is_pid_running_not_stopped(pid) && sid_has_active_presence_lock(&sid) {
+            return (Some(sid), true);
+        }
     }
 
-    let (proc_session_id, proc_live_jetski) =
+    let static_session_id =
+        pane::tab_agent_session_id_in_workspace(ws_id, pane_id, tab_id).or_else(|| {
+            layout_state::RestorableAgentIndex::load()
+                .agent_for_surface(ws_id, Some(pane_id), tab_id)
+                .map(|agent| agent.session_id)
+        });
+
+    if let Some(ref sid) = static_session_id {
+        if sid_has_active_presence_lock(sid) {
+            return (Some(sid.clone()), true);
+        }
+    }
+
+    let (proc_session, proc_live_jetski) =
         discover_live_jetski_session_for_tab(ws_id, pane_id, tab_id);
-    if proc_session_id.is_some() {
-        return (proc_session_id, true);
+    if let Some((pid, sid)) = proc_session {
+        DISCOVERED_TAB_SESSIONS.with(|map| {
+            map.borrow_mut().insert(cache_key, (pid, sid.clone()));
+        });
+        return (Some(sid), true);
     }
 
-    (session_id, proc_live_jetski || has_presence_lock)
+    DISCOVERED_TAB_SESSIONS.with(|map| {
+        map.borrow_mut().remove(&cache_key);
+    });
+    (static_session_id, proc_live_jetski)
 }
 
 fn tab_has_inflight_agent_work_for_session(session_id: &str) -> bool {
@@ -10346,6 +10392,41 @@ mod tests {
 "#,
         );
         assert!(!super::transcript_has_inflight_background_work(&transcript));
+    }
+
+    #[test]
+    fn presence_lock_liveness_rejects_unlocked_orphan_and_accepts_flocked_file() {
+        let temp_dir = std::env::temp_dir().join(format!("limux_a3_lock_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let orphan_lock = temp_dir.join("orphan.lock");
+        std::fs::write(&orphan_lock, b"").expect("write orphan lock");
+
+        // An unlocked 0-byte orphan .lock file on disk MUST return false.
+        assert!(
+            !super::is_presence_lock_actively_held(&orphan_lock),
+            "unlocked orphan .lock file must not be treated as an active presence lock"
+        );
+
+        // When a process holds an exclusive flock (LOCK_EX) on the file, it MUST return true.
+        let held_file = std::fs::File::open(&orphan_lock).expect("open lock file");
+        held_file.try_lock().expect("acquire exclusive flock");
+        assert!(
+            super::is_presence_lock_actively_held(&orphan_lock),
+            "exclusively flocked .lock file must be recognized as actively held"
+        );
+        drop(held_file);
+
+        // Once the holder drops the file descriptor, liveness MUST immediately return false.
+        assert!(
+            !super::is_presence_lock_actively_held(&orphan_lock),
+            "dropping the exclusive flock holder must immediately clear liveness"
+        );
+
+        // Current test runner process is running and not stopped.
+        assert!(super::is_pid_running_not_stopped(std::process::id()));
+        assert!(!super::is_pid_running_not_stopped(u32::MAX));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
