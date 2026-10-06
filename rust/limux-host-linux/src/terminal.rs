@@ -1891,14 +1891,18 @@ pub fn create_terminal(
             *surface_cell.borrow_mut() = Some(surface);
 
             let is_mapped = gl_area.is_mapped();
+            if is_mapped {
+                // Grab GTK focus so key events reach this widget when mapped.
+                request_terminal_focus(gl_area, &had_focus);
+            }
             gl_area.set_auto_render(is_mapped);
             unsafe {
                 ghostty_surface_set_occlusion(surface, is_mapped);
-                ghostty_surface_set_focus(surface, true);
+                ghostty_surface_set_focus(
+                    surface,
+                    is_mapped && (gl_area.is_focus() || had_focus.get()),
+                );
             }
-
-            // Grab GTK focus so key events reach this widget.
-            request_terminal_focus(gl_area, &had_focus);
         });
         track_signal(&signal_handlers, &gl_area, handler);
     }

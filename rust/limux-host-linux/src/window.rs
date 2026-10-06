@@ -951,6 +951,8 @@ fn queue_session_save_request<T: SessionSaveAccess>(state: &Rc<RefCell<T>>) -> S
     }
 }
 
+const SESSION_SAVE_DEBOUNCE_MS: u64 = 250;
+
 fn request_session_save(state: &State) {
     match queue_session_save_request(state) {
         SessionSaveRequest::Ignore => {}
@@ -962,17 +964,20 @@ fn request_session_save(state: &State) {
         }
         SessionSaveRequest::FlushOnIdle => {
             let state = state.clone();
-            glib::idle_add_local_once(move || {
-                let should_save = {
-                    let mut s = state.borrow_mut();
-                    let should_save = s.save_queued && !s.persistence_suspended;
-                    s.save_queued = false;
-                    should_save
-                };
-                if should_save {
-                    save_session_now(&state);
-                }
-            });
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS),
+                move || {
+                    let should_save = {
+                        let mut s = state.borrow_mut();
+                        let should_save = s.save_queued && !s.persistence_suspended;
+                        s.save_queued = false;
+                        should_save
+                    };
+                    if should_save {
+                        save_session_now(&state);
+                    }
+                },
+            );
         }
     }
 }
@@ -2451,7 +2456,10 @@ fn install_sidebar_resize(
             if !resizing_sidebar.replace(false) {
                 return;
             }
-            state.borrow_mut().sidebar_expanded_width = sidebar_width(&sidebar_shell);
+            let width = sidebar_width(&sidebar_shell);
+            if let Ok(mut s) = state.try_borrow_mut() {
+                s.sidebar_expanded_width = width;
+            }
             request_session_save(&state);
         });
     }
@@ -3923,12 +3931,15 @@ fn update_indicator_label(button: &gtk::Button, name: &str) {
     }
 }
 
-fn sync_indicator_order(state: &mut AppState) {
-    while let Some(child) = state.indicator_box.first_child() {
-        state.indicator_box.remove(&child);
-    }
-    for ws in &state.workspaces {
-        state.indicator_box.append(&ws.indicator_button);
+fn reorder_indicator_buttons(indicator_box: &gtk::Box, buttons: &[gtk::Button]) {
+    let mut prev: Option<&gtk::Button> = None;
+    for button in buttons {
+        if button.parent().as_ref() == Some(indicator_box.upcast_ref()) {
+            indicator_box.reorder_child_after(button, prev);
+        } else {
+            indicator_box.append(button);
+        }
+        prev = Some(button);
     }
 }
 
@@ -4509,14 +4520,59 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
-fn sync_sidebar_row_order(state: &mut AppState) {
-    while let Some(child) = state.sidebar_list.first_child() {
-        state.sidebar_list.remove(&child);
+fn snapshot_sidebar_and_indicator_order(
+    state: &AppState,
+) -> (
+    gtk::ListBox,
+    Vec<gtk::ListBoxRow>,
+    gtk::Box,
+    Vec<gtk::Button>,
+) {
+    let sidebar_rows = state
+        .workspaces
+        .iter()
+        .map(|ws| ws.sidebar_row.clone())
+        .collect();
+    let indicator_buttons = state
+        .workspaces
+        .iter()
+        .map(|ws| ws.indicator_button.clone())
+        .collect();
+    (
+        state.sidebar_list.clone(),
+        sidebar_rows,
+        state.indicator_box.clone(),
+        indicator_buttons,
+    )
+}
+
+fn apply_sidebar_and_indicator_order(
+    state: &State,
+    sidebar_list: &gtk::ListBox,
+    sidebar_rows: &[gtk::ListBoxRow],
+    indicator_box: &gtk::Box,
+    indicator_buttons: &[gtk::Button],
+    row_to_select: Option<&gtk::ListBoxRow>,
+) {
+    let prev_suppress = state
+        .try_borrow_mut()
+        .map(|mut s| std::mem::replace(&mut s.suppress_row_selection, true))
+        .unwrap_or(false);
+
+    while let Some(child) = sidebar_list.first_child() {
+        sidebar_list.remove(&child);
     }
-    for workspace in &state.workspaces {
-        state.sidebar_list.append(&workspace.sidebar_row);
+    for row in sidebar_rows {
+        sidebar_list.append(row);
     }
-    sync_indicator_order(state);
+    reorder_indicator_buttons(indicator_box, indicator_buttons);
+    if let Some(row) = row_to_select {
+        sidebar_list.select_row(Some(row));
+    }
+
+    if let Ok(mut s) = state.try_borrow_mut() {
+        s.suppress_row_selection = prev_suppress;
+    }
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
@@ -4678,7 +4734,7 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
-    let (sidebar_list, row_to_select) = {
+    let ((sidebar_list, sidebar_rows, indicator_box, indicator_buttons), row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
             .workspaces
@@ -4738,24 +4794,29 @@ fn reorder_workspace_by_id(
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let order = snapshot_sidebar_and_indicator_order(&s);
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (order, row_to_select)
     };
 
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
-    }
+    apply_sidebar_and_indicator_order(
+        state,
+        &sidebar_list,
+        &sidebar_rows,
+        &indicator_box,
+        &indicator_buttons,
+        row_to_select.as_ref(),
+    );
     request_session_save(state);
 
     true
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
-    let (sidebar_list, row_to_select) = {
+    let ((sidebar_list, sidebar_rows, indicator_box, indicator_buttons), row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(idx) = s
             .workspaces
@@ -4788,17 +4849,22 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let order = snapshot_sidebar_and_indicator_order(&s);
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (order, row_to_select)
     };
 
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
-    }
+    apply_sidebar_and_indicator_order(
+        state,
+        &sidebar_list,
+        &sidebar_rows,
+        &indicator_box,
+        &indicator_buttons,
+        row_to_select.as_ref(),
+    );
     request_session_save(state);
 }
 
@@ -4938,19 +5004,11 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         });
     }
     let row_clone = row.clone();
-    {
+    let indicator_button_clone = indicator_button.clone();
+    let favorite_button_clone = favorite_button.clone();
+    let close_button_clone = close_button.clone();
+    let (stack, sidebar_list, indicator_box) = {
         let mut app_state = state.borrow_mut();
-        app_state.stack.add_named(&root, Some(&stack_name));
-        app_state.sidebar_list.append(&row);
-        app_state.indicator_box.append(&indicator_button);
-        install_workspace_row_interactions(
-            state,
-            &new_workspace_id,
-            &row,
-            &favorite_button,
-            &close_button,
-        );
-
         app_state.workspaces.push(Workspace {
             id: new_workspace_id.clone(),
             name: seed.name.clone(),
@@ -4973,13 +5031,25 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
-        app_state.stack.set_visible_child_name(&stack_name);
-    }
+        (
+            app_state.stack.clone(),
+            app_state.sidebar_list.clone(),
+            app_state.indicator_box.clone(),
+        )
+    };
 
-    {
-        let sidebar_list = state.borrow().sidebar_list.clone();
-        sidebar_list.select_row(Some(&row_clone));
-    }
+    stack.add_named(&root, Some(&stack_name));
+    sidebar_list.append(&row_clone);
+    indicator_box.append(&indicator_button_clone);
+    install_workspace_row_interactions(
+        state,
+        &new_workspace_id,
+        &row_clone,
+        &favorite_button_clone,
+        &close_button_clone,
+    );
+    stack.set_visible_child_name(&stack_name);
+    sidebar_list.select_row(Some(&row_clone));
 
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
         apply_top_bar_mode(state);
@@ -4993,6 +5063,27 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         previous_active_workspace_id.as_deref(),
     );
     false
+}
+
+fn apply_workspace_drag_end_state(s: &mut AppState) {
+    s.workspace_dragging = None;
+    set_new_workspace_drop_mode(&s.new_ws_btn, false);
+    s.new_ws_btn
+        .remove_css_class("limux-sidebar-btn-trash-hover");
+}
+
+fn finish_workspace_drag(state: &State) {
+    pane::set_workspace_dragging_all(false);
+    if let Ok(mut s) = state.try_borrow_mut() {
+        apply_workspace_drag_end_state(&mut s);
+    } else {
+        let state = state.clone();
+        glib::idle_add_local_once(move || {
+            if let Ok(mut s) = state.try_borrow_mut() {
+                apply_workspace_drag_end_state(&mut s);
+            }
+        });
+    }
 }
 
 fn install_workspace_row_interactions(
@@ -5091,12 +5182,7 @@ fn install_workspace_row_interactions(
     {
         let state = state.clone();
         drag_source.connect_drag_end(move |_, _, _| {
-            let mut s = state.borrow_mut();
-            s.workspace_dragging = None;
-            set_new_workspace_drop_mode(&s.new_ws_btn, false);
-            s.new_ws_btn
-                .remove_css_class("limux-sidebar-btn-trash-hover");
-            pane::set_workspace_dragging_all(false);
+            finish_workspace_drag(&state);
         });
     }
     row.add_controller(drag_source);
@@ -6714,12 +6800,14 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
-    s.sidebar_list.remove(&ws.sidebar_row);
-    s.indicator_box.remove(&ws.indicator_button);
+    let sidebar_list = s.sidebar_list.clone();
+    let indicator_box = s.indicator_box.clone();
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        sidebar_list.remove(&ws.sidebar_row);
+        indicator_box.remove(&ws.indicator_button);
         crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
         if persist {
@@ -6744,8 +6832,10 @@ fn close_workspace_by_id_internal(
     let stack = s.stack.clone();
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     let row = s.workspaces[new_idx].sidebar_row.clone();
-    let sidebar_list = s.sidebar_list.clone();
     drop(s);
+
+    sidebar_list.remove(&ws.sidebar_row);
+    indicator_box.remove(&ws.indicator_button);
 
     // Show the new active workspace before hiding the old one: GtkStack maps
     // its first child the instant the visible child is hidden, so showing
@@ -8181,7 +8271,7 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
     }
 }
 
-const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum InflightTaskKind {
@@ -8219,11 +8309,26 @@ fn extract_json_arg_bool(
 
 pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool {
     let lines: Vec<&str> = transcript.lines().collect();
-    let scan_from = lines
+    let last_user_idx = lines
         .iter()
         .rposition(|line| line.contains("\"USER_EXPLICIT\"") && line.contains("\"USER_INPUT\""))
-        .map(|idx| idx.saturating_sub(5))
-        .unwrap_or(0);
+        .map(|idx| idx.saturating_sub(5));
+    let first_bg_idx = lines
+        .iter()
+        .position(|line| {
+            line.contains("Tool is running as a background task with task id:")
+                || (line.contains("Task: ") && line.contains("Status:"))
+                || line.contains("Created the following subagents:")
+                || line.contains(" active subagent(s):")
+                || line.contains("\"send_message\"")
+        })
+        .map(|idx| idx.saturating_sub(5));
+    let scan_from = match (last_user_idx, first_bg_idx) {
+        (Some(u), Some(b)) => u.min(b),
+        (Some(u), None) => u,
+        (None, Some(b)) => b,
+        (None, None) => 0,
+    };
 
     let mut steps: Vec<(usize, u64, serde_json::Value)> = lines[scan_from..]
         .iter()
@@ -8260,7 +8365,7 @@ pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool 
     let mut last_schedule_condition = "never".to_string();
     let mut last_command_is_daemon = false;
 
-    for (_, _, step) in &steps[start_idx..] {
+    for (step_idx, (_, _, step)) in steps.iter().enumerate() {
         let step_type = step
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -8272,7 +8377,12 @@ pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool 
 
         match step_type {
             "PLANNER_RESPONSE" => {
-                pending_planner_response = status == "PENDING";
+                if step_idx >= start_idx {
+                    pending_planner_response = status == "PENDING";
+                }
+                last_schedule_is_daemon = false;
+                last_schedule_condition = "never".to_string();
+                last_command_is_daemon = false;
                 if let Some(tool_calls) = step
                     .get("tool_calls")
                     .and_then(serde_json::Value::as_array)
@@ -8315,7 +8425,9 @@ pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool 
                 }
             }
             "GENERIC" => {
-                pending_planner_response = false;
+                if step_idx >= start_idx {
+                    pending_planner_response = false;
+                }
                 let content = step
                     .get("content")
                     .and_then(serde_json::Value::as_str)
@@ -8328,15 +8440,14 @@ pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool 
                     {
                         let is_timer = content.contains("\nTask Description: Timer:");
                         if is_timer {
+                            let condition = std::mem::replace(
+                                &mut last_schedule_condition,
+                                "never".to_string(),
+                            );
                             if !last_schedule_is_daemon {
                                 active_tasks.insert(
                                     task_id.to_string(),
-                                    InflightTaskKind::Timer {
-                                        condition: std::mem::replace(
-                                            &mut last_schedule_condition,
-                                            "never".to_string(),
-                                        ),
-                                    },
+                                    InflightTaskKind::Timer { condition },
                                 );
                             }
                             last_schedule_is_daemon = false;
@@ -8429,7 +8540,9 @@ pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool 
                 }
             }
             "SYSTEM_MESSAGE" => {
-                pending_planner_response = false;
+                if step_idx >= start_idx {
+                    pending_planner_response = false;
+                }
                 let content = step
                     .get("content")
                     .and_then(serde_json::Value::as_str)
@@ -8557,6 +8670,9 @@ fn discover_live_jetski_session_for_tab(
         return (None, false);
     };
 
+    let current_uid = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m));
     let mut has_live_jetski = false;
     let mut fallback_db_session: Option<(u32, String)> = None;
     for entry in entries.flatten() {
@@ -8567,6 +8683,14 @@ fn discover_live_jetski_session_for_tab(
         let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
         };
+        if let Some(uid) = current_uid {
+            if !entry
+                .metadata()
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == uid)
+            {
+                continue;
+            }
+        }
         if !is_pid_running_not_stopped(pid) {
             continue;
         }
@@ -10427,6 +10551,183 @@ mod tests {
         assert!(!super::is_pid_running_not_stopped(u32::MAX));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn transcript_inflight_work_preserves_cross_turn_background_tasks_and_subagents() {
+        // Turn 1 spawns a background task (conv-x/task-42) and a subagent (sub-x-1), followed
+        // by >8 intermediate steps and turns so last_user_idx (idx.saturating_sub(5)) > first_bg_idx.
+        let mut transcript = String::from(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start background build and audit"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"cargo test\"","IsDaemon":false}},{"name":"invoke_subagent","args":{}}]}
+{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: conv-x/task-42\nTask Description: cargo test\n"}
+{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created the following subagents:\n{\n  \"conversationId\": \"sub-x-1\",\n  \"role\": \"Auditor\"\n}"}
+{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Started both in background."}
+{"step_index":5,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 2 question 1"}
+{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 2 answer 1"}
+{"step_index":7,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 3 question 2"}
+{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 3 answer 2"}
+{"step_index":9,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 4 question 3"}
+{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 4 answer 3"}
+{"step_index":11,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 5 question 4"}
+{"step_index":12,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 5 answer 4"}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "background task and subagent from Turn 1 must remain tracked across >10 lines and multiple USER_INPUT turns"
+        );
+
+        // Task finishes, subagent still running -> still true.
+        transcript.push_str(
+            r#"{"step_index":13,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-10-06T21:00:00Z sender=conv-x/task-42 priority=MESSAGE_PRIORITY_HIGH content=Task id \"conv-x/task-42\" finished with result:\nDone"}
+{"step_index":14,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Build finished, waiting for subagent."}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "subagent from Turn 1 must still keep inflight work true after task finishes"
+        );
+
+        // Subagent finishes -> now false.
+        transcript.push_str(
+            r#"{"step_index":15,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-10-06T21:01:00Z sender=sub-x-1 priority=MESSAGE_PRIORITY_HIGH content=Audit complete."}
+{"step_index":16,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"All done!"}
+"#,
+        );
+        assert!(
+            !super::transcript_has_inflight_background_work(&transcript),
+            "once both cross-turn task and subagent complete, inflight work must be false"
+        );
+    }
+
+    #[test]
+    fn workspace_reorder_favorite_and_close_never_double_borrow_state_on_widget_remove() {
+        use super::*;
+
+        run_on_gtk_test_thread(|| {
+            let app = adw::Application::builder()
+                .application_id("com.limux.test.drag.reentrancy")
+                .build();
+            let window = adw::ApplicationWindow::builder().application(&app).build();
+            let sidebar_list = gtk::ListBox::new();
+            let indicator_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let stack = gtk::Stack::new();
+
+            let state: State = Rc::new(RefCell::new(AppState {
+                app,
+                window,
+                top_bar: None,
+                top_bar_content: None,
+                top_bar_minimize_btn: None,
+                top_bar_maximize_btn: None,
+                top_bar_close_btn: None,
+                sidebar_toggle: None,
+                top_bar_new_ws_btn_ref: None,
+                top_bar_settings_btn: None,
+                sidebar_header: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                sidebar_header_handle: gtk::WindowHandle::new(),
+                sidebar_drag_area: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                top_bar_visible: true,
+                config: Rc::new(RefCell::new(app_config::AppConfig::default())),
+                css_provider: gtk::CssProvider::new(),
+                system_prefers_dark: Rc::new(Cell::new(None)),
+                workspaces: Vec::new(),
+                active_idx: 0,
+                shortcuts: Rc::new(
+                    crate::shortcut_config::resolve_shortcuts_from_str("{}").unwrap(),
+                ),
+                stack: stack.clone(),
+                sidebar_list: sidebar_list.clone(),
+                sidebar_shell: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                sidebar_handle: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                new_ws_btn: gtk::Button::new(),
+                indicator_box: indicator_box.clone(),
+                indicator_scroll: gtk::ScrolledWindow::new(),
+                sidebar_animation: None,
+                sidebar_animation_epoch: 0,
+                sidebar_expanded_width: 220,
+                persistence_suspended: true,
+                suppress_row_selection: false,
+                save_queued: false,
+                session_store: Err("not used in test".to_string()),
+                session_save_notice: None,
+                session_close_dialog_open: false,
+                close_after_recovery: false,
+                workspace_dragging: Some("ws-0".to_string()),
+                desktop_notification_routes: HashMap::new(),
+                _theme_portal_signal: None,
+                _theme_gnome_settings: None,
+                _theme_gnome_signal: None,
+                _desktop_notification_token_signal: None,
+                _desktop_notification_action_signal: None,
+                _desktop_notification_closed_signal: None,
+            }));
+
+            let reentrant_borrows = Rc::new(Cell::new(0usize));
+
+            let make_ws = |id: &str, name: &str| {
+                let dummy_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let split_container = SplitTreeContainer::new(&state, dummy_pane.upcast());
+                let root = split_container.widget().clone();
+                stack.add_named(&root, Some(&format!("ws-{id}")));
+                let row = gtk::ListBoxRow::new();
+                let indicator_button = gtk::Button::new();
+                sidebar_list.append(&row);
+                indicator_box.append(&indicator_button);
+
+                // Simulate GTK's synchronous gdk_drop_finish -> DragSource::drag-end callback
+                // firing inside gtk_list_box_remove -> gtk_widget_unparent when a dragged row is removed.
+                let state_for_signal = state.clone();
+                let count_for_signal = reentrant_borrows.clone();
+                row.connect_parent_notify(move |r| {
+                    if r.parent().is_none() {
+                        // Must be able to mutably borrow state without RefCell double-borrow panic!
+                        let mut s = state_for_signal.borrow_mut();
+                        s.workspace_dragging = None;
+                        count_for_signal.set(count_for_signal.get() + 1);
+                    }
+                });
+
+                Workspace {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    root: root.upcast(),
+                    split_container,
+                    sidebar_row: row,
+                    name_label: gtk::Label::new(Some(name)),
+                    favorite_button: gtk::Button::new(),
+                    notify_dot: gtk::Label::new(Some("•")),
+                    notify_label: gtk::Label::new(None),
+                    unread: false,
+                    manual_unread: false,
+                    favorite: false,
+                    cwd: Rc::new(RefCell::new(None)),
+                    folder_path: None,
+                    autostart_command: Rc::new(RefCell::new(None)),
+                    path_label: gtk::Label::new(None),
+                    indicator_button,
+                    indicator_unread_dot: gtk::Label::new(Some("•")),
+                }
+            };
+
+            let ws0 = make_ws("ws-0", "Workspace 0");
+            let ws1 = make_ws("ws-1", "Workspace 1");
+            state.borrow_mut().workspaces = vec![ws0, ws1];
+
+            // 1. Reordering workspaces must not hold state.borrow_mut() across sidebar_list.remove().
+            assert!(reorder_workspace_by_id(&state, "ws-0", "ws-1", true));
+            assert!(reentrant_borrows.get() >= 2);
+            assert_eq!(state.borrow().workspace_dragging, None);
+
+            // 2. Toggling favorite must not hold state.borrow_mut() across sidebar_list.remove().
+            toggle_workspace_favorite(&state, "ws-0");
+            assert!(state.borrow().workspaces[0].favorite);
+
+            // 3. Closing workspace must not hold state.borrow_mut() across sidebar_list.remove().
+            close_workspace_by_id(&state, "ws-0");
+            assert_eq!(state.borrow().workspaces.len(), 1);
+        });
     }
 }
 
