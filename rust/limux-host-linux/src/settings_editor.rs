@@ -6,8 +6,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config::{
-    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, WindowControlsSide,
-    DEFAULT_UI_SCALE,
+    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UnreadColor,
+    WindowControlsSide, DEFAULT_UI_SCALE,
 };
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -100,7 +100,7 @@ const UI_SCALE_DESCRIPTORS: &[UiScaleDescriptor] = &[
 
 pub fn ui_scale_css(config: &AppConfig) -> String {
     let scale = config.appearance.ui_scale.get();
-    UI_SCALE_DESCRIPTORS
+    let mut rules: Vec<String> = UI_SCALE_DESCRIPTORS
         .iter()
         .map(|descriptor| {
             format!(
@@ -110,8 +110,15 @@ pub fn ui_scale_css(config: &AppConfig) -> String {
                 descriptor.base_size * scale
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let c = config.appearance.unread_color.css_color();
+    rules.push(format!(
+        ".limux-indicator-unread-dot, .limux-notify-dot, .limux-tab-unread-dot {{ color: {c}; }}\n\
+         .limux-notify-msg-unread {{ color: alpha({c}, 0.9); }}\n\
+         .limux-sidebar-row-unread {{ background-color: alpha({c}, 0.14); border-left: 3px solid {c}; }}\n\
+         .limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{ background: alpha({c}, 0.18); border-left: 3px solid {c}; }}"
+    ));
+    rules.join("\n")
 }
 
 type OnConfigChanged = dyn Fn(&AppConfig, &AppConfig);
@@ -262,6 +269,26 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     ghostty_row.set_activatable_widget(Some(&ghostty_dropdown));
     group.add(&ghostty_row);
 
+    let unread_color_row = adw::ActionRow::builder()
+        .title("Unread indicator color")
+        .subtitle("Accent color for unread workspace rows, borders, and tab dots (distinct from blue selection)")
+        .build();
+    unread_color_row.set_title_lines(1);
+    unread_color_row.set_subtitle_lines(2);
+    let unread_color_dropdown = gtk::DropDown::from_strings(UnreadColor::labels());
+    unread_color_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .appearance
+            .unread_color
+            .dropdown_index(),
+    );
+    unread_color_dropdown.set_valign(gtk::Align::Center);
+    unread_color_row.add_suffix(&unread_color_dropdown);
+    unread_color_row.set_activatable_widget(Some(&unread_color_dropdown));
+    group.add(&unread_color_row);
+
     let hover_row = adw::ActionRow::builder()
         .title("Hover terminal focus")
         .subtitle("Focus terminal panes when the mouse pointer enters them")
@@ -306,6 +333,25 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     keep_workspace_open_row.add_suffix(&keep_workspace_open_switch);
     keep_workspace_open_row.set_activatable_widget(Some(&keep_workspace_open_switch));
     group.add(&keep_workspace_open_row);
+
+    let prompt_workspace_folder_row = adw::ActionRow::builder()
+        .title("Ask for folder on new workspace")
+        .subtitle("Prompt for a folder address when creating a new workspace")
+        .build();
+    prompt_workspace_folder_row.set_title_lines(1);
+    prompt_workspace_folder_row.set_subtitle_lines(2);
+    let prompt_workspace_folder_switch = gtk::Switch::new();
+    prompt_workspace_folder_switch.set_active(
+        input
+            .config
+            .borrow()
+            .workspace
+            .prompt_for_folder_on_create,
+    );
+    prompt_workspace_folder_switch.set_valign(gtk::Align::Center);
+    prompt_workspace_folder_row.add_suffix(&prompt_workspace_folder_switch);
+    prompt_workspace_folder_row.set_activatable_widget(Some(&prompt_workspace_folder_switch));
+    group.add(&prompt_workspace_folder_row);
 
     let auto_copy_row = adw::ActionRow::builder()
         .title("Copy selection automatically")
@@ -451,6 +497,16 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
+        unread_color_dropdown.connect_selected_notify(move |dropdown| {
+            let unread_color = UnreadColor::from_dropdown_index(dropdown.selected());
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.unread_color = unread_color;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
         hover_switch.connect_active_notify(move |switch| {
             let hover_terminal_focus = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
@@ -486,6 +542,16 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             let keep_open = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.workspace.keep_open_after_last_terminal_closes = keep_open;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        prompt_workspace_folder_switch.connect_active_notify(move |switch| {
+            let prompt_for_folder = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.workspace.prompt_for_folder_on_create = prompt_for_folder;
             });
         });
     }

@@ -54,6 +54,8 @@ struct Workspace {
     notify_label: gtk::Label,
     /// Unread state for notifications without a tab target.
     unread: bool,
+    /// Explicitly marked unread via user context menu action.
+    manual_unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
     /// Background colour of the sidebar row, if the user picked one.
@@ -104,6 +106,7 @@ pub(crate) struct AppState {
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
+    suppress_row_selection: bool,
     save_queued: bool,
     session_store: Result<crate::session_store::SessionStore, String>,
     session_save_notice: Option<String>,
@@ -953,6 +956,8 @@ fn queue_session_save_request<T: SessionSaveAccess>(state: &Rc<RefCell<T>>) -> S
     }
 }
 
+const SESSION_SAVE_DEBOUNCE_MS: u64 = 250;
+
 fn request_session_save(state: &State) {
     match queue_session_save_request(state) {
         SessionSaveRequest::Ignore => {}
@@ -964,17 +969,20 @@ fn request_session_save(state: &State) {
         }
         SessionSaveRequest::FlushOnIdle => {
             let state = state.clone();
-            glib::idle_add_local_once(move || {
-                let should_save = {
-                    let mut s = state.borrow_mut();
-                    let should_save = s.save_queued && !s.persistence_suspended;
-                    s.save_queued = false;
-                    should_save
-                };
-                if should_save {
-                    save_session_now(&state);
-                }
-            });
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS),
+                move || {
+                    let should_save = {
+                        let mut s = state.borrow_mut();
+                        let should_save = s.save_queued && !s.persistence_suspended;
+                        s.save_queued = false;
+                        should_save
+                    };
+                    if should_save {
+                        save_session_now(&state);
+                    }
+                },
+            );
         }
     }
 }
@@ -1369,7 +1377,9 @@ pub(crate) fn apply_split_ratio_after_layout(
 }
 
 pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
-    update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
+    if split_ratio_state(paned).is_none() {
+        update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
+    }
     let state = state.clone();
     paned.connect_position_notify(move |paned| {
         let allocation = paned.allocation();
@@ -1499,7 +1509,7 @@ const BASE_CSS: &str = r#"
     font-weight: 600;
 }
 .limux-indicator-unread-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 7px;
     margin-right: 4px;
 }
@@ -1614,7 +1624,7 @@ const BASE_CSS: &str = r#"
     margin: 0;
 }
 .limux-notify-dot {
-    color: @accent_bg_color;
+    color: #f59e0b;
     font-size: 8px;
     margin-right: 6px;
 }
@@ -1628,14 +1638,18 @@ const BASE_CSS: &str = r#"
     font-size: 11px;
 }
 .limux-notify-msg-unread {
-    color: alpha(@accent_bg_color, 0.85);
+    color: alpha(#f59e0b, 0.9);
     font-size: 11px;
 }
 .limux-sidebar-row-unread {
-    background-color: alpha(@accent_bg_color, 0.1);
-    border-left: 3px solid @accent_bg_color;
+    background-color: alpha(#f59e0b, 0.14);
+    border-left: 3px solid #f59e0b;
     border-radius: 8px;
     margin-left: 3px;
+}
+.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {
+    background: alpha(#f59e0b, 0.18);
+    border-left: 3px solid #f59e0b;
 }
 .limux-sidebar-row-unread .limux-ws-name {
     color: @window_fg_color;
@@ -2095,6 +2109,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
+        suppress_row_selection: false,
         save_queued: false,
         session_store: Err("Session storage has not been initialized".to_string()),
         session_save_notice: None,
@@ -2137,7 +2152,7 @@ pub fn build_window(app: &adw::Application) {
                 .active_workspace()
                 .map(|workspace| workspace.id.clone());
             if let Some(workspace_id) = workspace_id {
-                clear_visible_tab_unread(&state, &workspace_id);
+                clear_visible_tab_unread_on_window_focus(&state, &workspace_id);
             }
         });
     }
@@ -2218,11 +2233,32 @@ pub fn build_window(app: &adw::Application) {
 
     {
         let state = state.clone();
-        sidebar_list.connect_row_selected(move |_, row| {
-            if let Some(row) = row {
+        sidebar_list.connect_row_selected(move |list, row| {
+            let Some(row) = row else {
+                return;
+            };
+            let (suppress, active_row, idx) = {
+                let s = state.borrow();
                 let idx = row.index() as usize;
-                switch_workspace(&state, idx);
+                let suppress = s.suppress_row_selection
+                    || pane::widget_has_open_popover(row.upcast_ref());
+                let active_row = s
+                    .workspaces
+                    .get(s.active_idx)
+                    .map(|ws| ws.sidebar_row.clone());
+                (suppress, active_row, idx)
+            };
+            if suppress {
+                if let Some(active_row) = active_row {
+                    if &active_row != row {
+                        state.borrow_mut().suppress_row_selection = true;
+                        list.select_row(Some(&active_row));
+                        state.borrow_mut().suppress_row_selection = false;
+                    }
+                }
+                return;
             }
+            switch_workspace(&state, idx);
         });
     }
 
@@ -2326,6 +2362,10 @@ pub fn build_window(app: &adw::Application) {
     crate::control_bridge::start(dispatch_control_command);
 
     window.present();
+
+    // Realize every restored tab so background agents come back on their own.
+    // Without this, a restored session stays dead until its tab is clicked.
+    schedule_startup_eager_restore(&state);
 
     // Ask the compositor for server-side decorations when it supports the
     // KDE server-decoration protocol (see the header-bar decision above).
@@ -2435,7 +2475,10 @@ fn install_sidebar_resize(
             if !resizing_sidebar.replace(false) {
                 return;
             }
-            state.borrow_mut().sidebar_expanded_width = sidebar_width(&sidebar_shell);
+            let width = sidebar_width(&sidebar_shell);
+            if let Ok(mut s) = state.try_borrow_mut() {
+                s.sidebar_expanded_width = width;
+            }
             request_session_save(&state);
         });
     }
@@ -2931,7 +2974,9 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
-    if updated.appearance.ui_scale != previous.appearance.ui_scale {
+    if updated.appearance.ui_scale != previous.appearance.ui_scale
+        || updated.appearance.unread_color != previous.appearance.unread_color
+    {
         reload_app_css(state, updated);
     }
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -2947,7 +2992,9 @@ fn handle_config_change(
     if let Err(err) = app_config::save(updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
-        if updated.appearance.ui_scale != previous.appearance.ui_scale {
+        if updated.appearance.ui_scale != previous.appearance.ui_scale
+            || updated.appearance.unread_color != previous.appearance.unread_color
+        {
             reload_app_css(state, previous);
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
@@ -3903,12 +3950,15 @@ fn update_indicator_label(button: &gtk::Button, name: &str) {
     }
 }
 
-fn sync_indicator_order(state: &mut AppState) {
-    while let Some(child) = state.indicator_box.first_child() {
-        state.indicator_box.remove(&child);
-    }
-    for ws in &state.workspaces {
-        state.indicator_box.append(&ws.indicator_button);
+fn reorder_indicator_buttons(indicator_box: &gtk::Box, buttons: &[gtk::Button]) {
+    let mut prev: Option<&gtk::Button> = None;
+    for button in buttons {
+        if button.parent().as_ref() == Some(indicator_box.upcast_ref()) {
+            indicator_box.reorder_child_after(button, prev);
+        } else {
+            indicator_box.append(button);
+        }
+        prev = Some(button);
     }
 }
 
@@ -4120,6 +4170,7 @@ fn next_active_workspace_index(
 }
 
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
+    pane::dismiss_open_popovers(row.upcast_ref());
     let preferred_pane_id = find_leaf_focused_pane(state)
         .filter(|(id, _)| id == workspace_id)
         .and_then(|(_, pane)| pane::active_surface_summary(&pane).map(|surface| surface.pane_id));
@@ -4129,10 +4180,28 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    let is_unread = {
+        let app_state = state.borrow();
+        let ws_unread = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .is_some_and(|workspace| workspace.unread);
+        has_unread(ws_unread, pane::workspace_has_unread_tabs(workspace_id))
+    };
+    let unread_btn = gtk::Button::with_label(if is_unread {
+        "Mark as Read"
+    } else {
+        "Mark as Unread"
+    });
+    unread_btn.add_css_class("flat");
+    unread_btn.set_focus_on_click(false);
     let new_tab_btn = gtk::Button::with_label("New tab from workspace directory");
     new_tab_btn.add_css_class("flat");
+    new_tab_btn.set_focus_on_click(false);
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
+    rename_btn.set_focus_on_click(false);
     let has_autostart = {
         let app_state = state.borrow();
         app_state
@@ -4147,10 +4216,13 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         "Set Autostart…"
     });
     autostart_btn.add_css_class("flat");
+    autostart_btn.set_focus_on_click(false);
     let delete_btn = gtk::Button::with_label("Delete");
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
+    delete_btn.set_focus_on_click(false);
 
+    menu_box.append(&unread_btn);
     menu_box.append(&new_tab_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
@@ -4228,54 +4300,115 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         });
     }
 
+    let absorb_click = gtk::GestureClick::new();
+    absorb_click.set_button(0);
+    absorb_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    absorb_click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    absorb_click.connect_released(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    popover.add_controller(absorb_click);
+
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        unread_btn.connect_clicked(move |_| {
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                state.borrow_mut().suppress_row_selection = true;
+                pane::close_context_popover(&pop);
+                state.borrow_mut().suppress_row_selection = false;
+                let root = {
+                    let mut app_state = state.borrow_mut();
+                    let Some(workspace) = app_state
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == ws_id)
+                    else {
+                        return;
+                    };
+                    if is_unread {
+                        workspace.unread = false;
+                        workspace.manual_unread = false;
+                    } else {
+                        workspace.unread = true;
+                        workspace.manual_unread = true;
+                    }
+                    workspace.root.clone()
+                };
+                if is_unread {
+                    pane::clear_all_tabs_unread_in_workspace(&ws_id);
+                    pane::clear_all_tabs_unread_in_root(&root);
+                } else if !pane::mark_active_tab_manual_unread_in_workspace(
+                    &ws_id,
+                    preferred_pane_id,
+                ) {
+                    pane::mark_active_tab_manual_unread_in_root(&root);
+                }
+                sync_workspace_unread(&state, &ws_id);
+                request_session_save(&state);
+            });
+        });
+    }
+
     {
         let state = state.clone();
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
         new_tab_btn.connect_clicked(move |_| {
-            pop.popdown();
-            let (index, directory, row, sidebar_list, target_pane) = {
-                let app_state = state.borrow();
-                let Some(index) = app_state
-                    .workspaces
-                    .iter()
-                    .position(|workspace| workspace.id == ws_id)
-                else {
-                    return;
-                };
-                let workspace = &app_state.workspaces[index];
-                let target_pane = preferred_pane_id
-                    .and_then(|id| pane::pane_widget_for_root(&workspace.root, id))
-                    .or_else(|| {
-                        let first = first_leaf_pane(&workspace.root);
-                        pane::active_surface_summary(&first).and_then(|surface| {
-                            pane::pane_widget_for_root(&workspace.root, surface.pane_id)
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                pane::close_context_popover(&pop);
+                let (index, directory, row, sidebar_list, target_pane) = {
+                    let app_state = state.borrow();
+                    let Some(index) = app_state
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == ws_id)
+                    else {
+                        return;
+                    };
+                    let workspace = &app_state.workspaces[index];
+                    let target_pane = preferred_pane_id
+                        .and_then(|id| pane::pane_widget_for_root(&workspace.root, id))
+                        .or_else(|| {
+                            let first = first_leaf_pane(&workspace.root);
+                            pane::active_surface_summary(&first).and_then(|surface| {
+                                pane::pane_widget_for_root(&workspace.root, surface.pane_id)
+                            })
                         })
-                    })
-                    .or_else(|| {
-                        let first = pane::pane_summaries_for_root(&workspace.root)
-                            .first()?
-                            .pane_id;
-                        pane::pane_widget_for_root(&workspace.root, first)
-                    });
-                let Some(target_pane) = target_pane else {
-                    return;
+                        .or_else(|| {
+                            let first = pane::pane_summaries_for_root(&workspace.root)
+                                .first()?
+                                .pane_id;
+                            pane::pane_widget_for_root(&workspace.root, first)
+                        });
+                    let Some(target_pane) = target_pane else {
+                        return;
+                    };
+                    let directory = workspace
+                        .folder_path
+                        .clone()
+                        .or_else(|| workspace.cwd.borrow().clone());
+                    (
+                        index,
+                        directory,
+                        workspace.sidebar_row.clone(),
+                        app_state.sidebar_list.clone(),
+                        target_pane,
+                    )
                 };
-                let directory = workspace
-                    .folder_path
-                    .clone()
-                    .or_else(|| workspace.cwd.borrow().clone());
-                (
-                    index,
-                    directory,
-                    workspace.sidebar_row.clone(),
-                    app_state.sidebar_list.clone(),
-                    target_pane,
-                )
-            };
-            switch_workspace(&state, index);
-            sidebar_list.select_row(Some(&row));
-            pane::add_terminal_tab_to_pane_in_directory(&target_pane, directory.as_deref());
+                switch_workspace(&state, index);
+                sidebar_list.select_row(Some(&row));
+                pane::add_terminal_tab_to_pane_in_directory(&target_pane, directory.as_deref());
+            });
         });
     }
     {
@@ -4283,8 +4416,15 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
         rename_btn.connect_clicked(move |_| {
-            pop.popdown();
-            begin_workspace_inline_rename(&state, &ws_id);
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                state.borrow_mut().suppress_row_selection = true;
+                pane::close_context_popover(&pop);
+                state.borrow_mut().suppress_row_selection = false;
+                begin_workspace_inline_rename(&state, &ws_id);
+            });
         });
     }
     {
@@ -4292,8 +4432,15 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
         autostart_btn.connect_clicked(move |_| {
-            pop.popdown();
-            show_workspace_autostart_dialog(&state, &ws_id);
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                state.borrow_mut().suppress_row_selection = true;
+                pane::close_context_popover(&pop);
+                state.borrow_mut().suppress_row_selection = false;
+                show_workspace_autostart_dialog(&state, &ws_id);
+            });
         });
     }
     {
@@ -4301,9 +4448,16 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
-            pop.popdown();
-            close_workspace_by_id(&state, &ws_id);
-            request_session_save(&state);
+            let state = state.clone();
+            let ws_id = ws_id.clone();
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                state.borrow_mut().suppress_row_selection = true;
+                pane::close_context_popover(&pop);
+                state.borrow_mut().suppress_row_selection = false;
+                close_workspace_by_id(&state, &ws_id);
+                request_session_save(&state);
+            });
         });
     }
     {
@@ -4312,7 +4466,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         });
     }
 
-    popover.popup();
+    pane::popup_context_popover(&popover);
 }
 
 fn normalize_autostart_command(command: &str) -> Option<String> {
@@ -4452,14 +4606,59 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
-fn sync_sidebar_row_order(state: &mut AppState) {
-    while let Some(child) = state.sidebar_list.first_child() {
-        state.sidebar_list.remove(&child);
+fn snapshot_sidebar_and_indicator_order(
+    state: &AppState,
+) -> (
+    gtk::ListBox,
+    Vec<gtk::ListBoxRow>,
+    gtk::Box,
+    Vec<gtk::Button>,
+) {
+    let sidebar_rows = state
+        .workspaces
+        .iter()
+        .map(|ws| ws.sidebar_row.clone())
+        .collect();
+    let indicator_buttons = state
+        .workspaces
+        .iter()
+        .map(|ws| ws.indicator_button.clone())
+        .collect();
+    (
+        state.sidebar_list.clone(),
+        sidebar_rows,
+        state.indicator_box.clone(),
+        indicator_buttons,
+    )
+}
+
+fn apply_sidebar_and_indicator_order(
+    state: &State,
+    sidebar_list: &gtk::ListBox,
+    sidebar_rows: &[gtk::ListBoxRow],
+    indicator_box: &gtk::Box,
+    indicator_buttons: &[gtk::Button],
+    row_to_select: Option<&gtk::ListBoxRow>,
+) {
+    let prev_suppress = state
+        .try_borrow_mut()
+        .map(|mut s| std::mem::replace(&mut s.suppress_row_selection, true))
+        .unwrap_or(false);
+
+    while let Some(child) = sidebar_list.first_child() {
+        sidebar_list.remove(&child);
     }
-    for workspace in &state.workspaces {
-        state.sidebar_list.append(&workspace.sidebar_row);
+    for row in sidebar_rows {
+        sidebar_list.append(row);
     }
-    sync_indicator_order(state);
+    reorder_indicator_buttons(indicator_box, indicator_buttons);
+    if let Some(row) = row_to_select {
+        sidebar_list.select_row(Some(row));
+    }
+
+    if let Ok(mut s) = state.try_borrow_mut() {
+        s.suppress_row_selection = prev_suppress;
+    }
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
@@ -4514,29 +4713,31 @@ fn set_workspace_color(state: &State, workspace_id: &str, color: Option<Workspac
     true
 }
 
-/// Find an active rename Entry in the sidebar (if any).
-fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
-    fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
-        if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-            return Some(entry.clone());
-        }
-        let mut child = widget.first_child();
-        while let Some(c) = child {
-            if let Some(entry) = find_entry(&c) {
-                return Some(entry);
-            }
-            child = c.next_sibling();
-        }
-        None
+fn find_rename_entry_in_widget(widget: &gtk::Widget) -> Option<gtk::Entry> {
+    if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+        return Some(entry.clone());
     }
-    let mut row = sidebar_list.first_child();
-    while let Some(r) = row {
-        if let Some(entry) = find_entry(&r) {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(entry) = find_rename_entry_in_widget(&c) {
             return Some(entry);
         }
-        row = r.next_sibling();
+        child = c.next_sibling();
     }
     None
+}
+
+/// Find an active rename Entry in the sidebar (if any).
+fn find_active_rename_entry(sidebar_list: &gtk::ListBox) -> Option<gtk::Entry> {
+    find_rename_entry_in_widget(sidebar_list.upcast_ref())
+}
+
+fn should_trigger_workspace_double_click_rename(
+    n_press: i32,
+    has_active_rename_entry: bool,
+    clicked_favorite_button: bool,
+) -> bool {
+    n_press == 2 && !has_active_rename_entry && !clicked_favorite_button
 }
 
 fn commit_inline_rename_for_click(
@@ -4653,7 +4854,7 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
-    let (sidebar_list, row_to_select) = {
+    let ((sidebar_list, sidebar_rows, indicator_box, indicator_buttons), row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
             .workspaces
@@ -4713,24 +4914,29 @@ fn reorder_workspace_by_id(
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let order = snapshot_sidebar_and_indicator_order(&s);
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (order, row_to_select)
     };
 
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
-    }
+    apply_sidebar_and_indicator_order(
+        state,
+        &sidebar_list,
+        &sidebar_rows,
+        &indicator_box,
+        &indicator_buttons,
+        row_to_select.as_ref(),
+    );
     request_session_save(state);
 
     true
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
-    let (sidebar_list, row_to_select) = {
+    let ((sidebar_list, sidebar_rows, indicator_box, indicator_buttons), row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(idx) = s
             .workspaces
@@ -4763,17 +4969,22 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
             }
         }
 
-        sync_sidebar_row_order(&mut s);
+        let order = snapshot_sidebar_and_indicator_order(&s);
         let row_to_select = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        (order, row_to_select)
     };
 
-    if let Some(row) = row_to_select {
-        sidebar_list.select_row(Some(&row));
-    }
+    apply_sidebar_and_indicator_order(
+        state,
+        &sidebar_list,
+        &sidebar_rows,
+        &indicator_box,
+        &indicator_buttons,
+        row_to_select.as_ref(),
+    );
     request_session_save(state);
 }
 
@@ -4913,13 +5124,11 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         });
     }
     let row_clone = row.clone();
-    {
+    let indicator_button_clone = indicator_button.clone();
+    let favorite_button_clone = favorite_button.clone();
+    let close_button_clone = close_button.clone();
+    let (stack, sidebar_list, indicator_box) = {
         let mut app_state = state.borrow_mut();
-        app_state.stack.add_named(&root, Some(&stack_name));
-        app_state.sidebar_list.append(&row);
-        app_state.indicator_box.append(&indicator_button);
-        install_workspace_row_interactions(state, &new_workspace_id, &row, &favorite_button);
-
         app_state.workspaces.push(Workspace {
             id: new_workspace_id.clone(),
             name: seed.name.clone(),
@@ -4931,6 +5140,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_dot,
             notify_label,
             unread: false,
+            manual_unread: false,
             favorite: false,
             color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
@@ -4942,13 +5152,25 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
         sync_indicator_active_state(&app_state);
-        app_state.stack.set_visible_child_name(&stack_name);
-    }
+        (
+            app_state.stack.clone(),
+            app_state.sidebar_list.clone(),
+            app_state.indicator_box.clone(),
+        )
+    };
 
-    {
-        let sidebar_list = state.borrow().sidebar_list.clone();
-        sidebar_list.select_row(Some(&row_clone));
-    }
+    stack.add_named(&root, Some(&stack_name));
+    sidebar_list.append(&row_clone);
+    indicator_box.append(&indicator_button_clone);
+    install_workspace_row_interactions(
+        state,
+        &new_workspace_id,
+        &row_clone,
+        &favorite_button_clone,
+        &close_button_clone,
+    );
+    stack.set_visible_child_name(&stack_name);
+    sidebar_list.select_row(Some(&row_clone));
 
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
         apply_top_bar_mode(state);
@@ -4964,44 +5186,102 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     false
 }
 
+fn apply_workspace_drag_end_state(s: &mut AppState) {
+    s.workspace_dragging = None;
+    set_new_workspace_drop_mode(&s.new_ws_btn, false);
+    s.new_ws_btn
+        .remove_css_class("limux-sidebar-btn-trash-hover");
+}
+
+fn finish_workspace_drag(state: &State) {
+    pane::set_workspace_dragging_all(false);
+    if let Ok(mut s) = state.try_borrow_mut() {
+        apply_workspace_drag_end_state(&mut s);
+    } else {
+        let state = state.clone();
+        glib::idle_add_local_once(move || {
+            if let Ok(mut s) = state.try_borrow_mut() {
+                apply_workspace_drag_end_state(&mut s);
+            }
+        });
+    }
+}
+
 fn install_workspace_row_interactions(
     state: &State,
     workspace_id: &str,
     row: &gtk::ListBoxRow,
     favorite_button: &gtk::Button,
+    close_button: &gtk::Button,
 ) {
+    let left_click = gtk::GestureClick::new();
+    left_click.set_button(1);
+    {
+        let state = state.clone();
+        let workspace_id = workspace_id.to_string();
+        let r = row.clone();
+        let fav_btn = favorite_button.clone();
+        let close_btn = close_button.clone();
+        left_click.connect_pressed(move |gesture, n_press, x, y| {
+            let has_active_rename_entry = find_rename_entry_in_widget(r.upcast_ref()).is_some();
+            if has_active_rename_entry
+                || state.borrow().suppress_row_selection
+                || pane::widget_has_open_popover(r.upcast_ref())
+            {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            let clicked_favorite_button = r
+                .translate_coordinates(&fav_btn, x, y)
+                .is_some_and(|(bx, by)| fav_btn.contains(bx, by));
+            let clicked_close_button = r
+                .translate_coordinates(&close_btn, x, y)
+                .is_some_and(|(bx, by)| close_btn.contains(bx, by));
+            let clicked_action_button = clicked_favorite_button || clicked_close_button;
+            if should_trigger_workspace_double_click_rename(
+                n_press,
+                has_active_rename_entry,
+                clicked_action_button,
+            ) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let state = state.clone();
+                let workspace_id = workspace_id.clone();
+                glib::idle_add_local_once(move || {
+                    begin_workspace_inline_rename(&state, &workspace_id);
+                });
+            } else if n_press == 1 && !clicked_action_button {
+                clear_visible_tab_unread_on_user_action(&state, &workspace_id);
+            }
+        });
+    }
+    row.add_controller(left_click);
+
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
     {
         let state = state.clone();
         let workspace_id = workspace_id.to_string();
         let r = row.clone();
-        right_click.connect_pressed(move |_, _, _, _| {
+        right_click.connect_pressed(move |gesture, _, _, _| {
+            if find_rename_entry_in_widget(r.upcast_ref()).is_some() {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             show_workspace_context_menu(&state, &workspace_id, &r);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
         });
     }
     row.add_controller(right_click);
-
-    // Double-left-click anywhere on the row starts inline rename.
-    let double_click = gtk::GestureClick::new();
-    double_click.set_button(1);
-    {
-        let state = state.clone();
-        let workspace_id = workspace_id.to_string();
-        double_click.connect_pressed(move |gesture, n_press, _, _| {
-            if n_press == 2 {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                begin_workspace_inline_rename(&state, &workspace_id);
-            }
-        });
-    }
-    row.add_controller(double_click);
 
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     {
         let workspace_id = workspace_id.to_string();
+        let r = row.clone();
         drag_source.connect_prepare(move |_, _, _| {
+            if find_rename_entry_in_widget(r.upcast_ref()).is_some() {
+                return None;
+            }
             let payload = glib::Value::from(&workspace_id);
             Some(gtk::gdk::ContentProvider::for_value(&payload))
         });
@@ -5023,12 +5303,7 @@ fn install_workspace_row_interactions(
     {
         let state = state.clone();
         drag_source.connect_drag_end(move |_, _, _| {
-            let mut s = state.borrow_mut();
-            s.workspace_dragging = None;
-            set_new_workspace_drop_mode(&s.new_ws_btn, false);
-            s.new_ws_btn
-                .remove_css_class("limux-sidebar-btn-trash-hover");
-            pane::set_workspace_dragging_all(false);
+            finish_workspace_drag(&state);
         });
     }
     row.add_controller(drag_source);
@@ -5159,8 +5434,30 @@ fn install_workspace_row_interactions(
     }
 }
 
-fn add_workspace(state: &State, _working_directory: Option<&str>) {
-    show_workspace_path_dialog(state);
+fn add_workspace(state: &State, working_directory: Option<&str>) {
+    let prompt_for_folder = state
+        .borrow()
+        .config
+        .borrow()
+        .workspace
+        .prompt_for_folder_on_create;
+    if prompt_for_folder {
+        show_workspace_path_dialog(state);
+        return;
+    }
+
+    let folder = working_directory
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let folder_path = folder.to_string_lossy().to_string();
+    let name = folder
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| folder_path.clone());
+    create_workspace_with_folder(state, &name, &folder_path);
 }
 
 fn active_window(state: &State) -> Option<gtk::Window> {
@@ -6338,7 +6635,7 @@ fn add_workspace_with_initial_command(
             show_workspace_path,
         );
     sidebar_list.append(&row);
-    install_workspace_row_interactions(state, &id, &row, &favorite_button);
+    install_workspace_row_interactions(state, &id, &row, &favorite_button, &close_button);
     // Wire close button
     {
         let state = state.clone();
@@ -6384,6 +6681,7 @@ fn add_workspace_with_initial_command(
         notify_dot,
         notify_label,
         unread: false,
+        manual_unread: false,
         favorite: workspace.favorite,
         color: workspace.color,
         cwd,
@@ -6565,6 +6863,13 @@ pub(crate) fn create_pane_for_workspace(
             move || request_session_save(&state)
         }),
         on_unread_changed: Box::new(move || {
+            if !pane::workspace_has_unread_tabs(&ws_id_unread) {
+                let mut s = state_for_unread.borrow_mut();
+                if let Some(ws) = s.workspaces.iter_mut().find(|w| w.id == ws_id_unread) {
+                    ws.unread = false;
+                    ws.manual_unread = false;
+                }
+            }
             sync_workspace_unread(&state_for_unread, &ws_id_unread);
         }),
         is_pane_visible: Box::new(move |pane_widget| {
@@ -6643,12 +6948,14 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
-    s.sidebar_list.remove(&ws.sidebar_row);
-    s.indicator_box.remove(&ws.indicator_button);
+    let sidebar_list = s.sidebar_list.clone();
+    let indicator_box = s.indicator_box.clone();
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        sidebar_list.remove(&ws.sidebar_row);
+        indicator_box.remove(&ws.indicator_button);
         split_container.retire_panes();
         crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
@@ -6674,8 +6981,10 @@ fn close_workspace_by_id_internal(
     let stack = s.stack.clone();
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     let row = s.workspaces[new_idx].sidebar_row.clone();
-    let sidebar_list = s.sidebar_list.clone();
     drop(s);
+
+    sidebar_list.remove(&ws.sidebar_row);
+    indicator_box.remove(&ws.indicator_button);
 
     // Show the new active workspace before hiding the old one: GtkStack maps
     // its first child the instant the visible child is hidden, so showing
@@ -6694,6 +7003,143 @@ fn close_workspace_by_id_internal(
     if persist {
         request_session_save(state);
     }
+}
+
+/// One tab that the startup sweep still has to realize.
+struct EagerRestoreStep {
+    workspace_idx: usize,
+    pane: gtk::Widget,
+    tab_id: String,
+}
+
+/// Interval between sweep steps. One GTK frame is enough for the stack to map
+/// the child and for `GtkGLArea::realize` to fire, which is what actually
+/// creates the Ghostty surface and forks the PTY.
+const EAGER_RESTORE_STEP_MS: u64 = 90;
+
+/// Kick off the startup eager-restore sweep shortly after the window appears.
+///
+/// Limux restores tabs lazily: a tab's PTY is not created until GTK realizes
+/// its `GtkGLArea`, and a stack only realizes its visible child. A restored
+/// agent sitting in a background tab therefore stays dead until the user
+/// clicks it, which is why session recovery previously required an external
+/// script to crawl workspaces over the control socket — and, for background
+/// tabs it could not reach, to split panes and type `cli --resume` into them.
+/// That produced duplicate sessions, presence-lock collisions and permanent
+/// layout damage. Doing the sweep in-process removes the need for all of it.
+///
+/// Set `LIMUX_EAGER_RESTORE=0` to opt out.
+fn schedule_startup_eager_restore(state: &State) {
+    if matches!(std::env::var("LIMUX_EAGER_RESTORE").as_deref(), Ok("0")) {
+        eprintln!("limux: startup eager restore disabled via LIMUX_EAGER_RESTORE=0");
+        return;
+    }
+
+    let state = state.clone();
+    // Let the first frame settle so the initial workspace finishes mapping
+    // before we start switching the stack underneath it.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+        run_startup_eager_restore(&state);
+    });
+}
+
+fn run_startup_eager_restore(state: &State) {
+    let original_idx = state.borrow().active_idx;
+
+    let mut steps: Vec<EagerRestoreStep> = Vec::new();
+    // Per-pane selection captured up front, so the sweep is invisible: every
+    // pane ends on the tab the user left it on.
+    let mut restore: Vec<(gtk::Widget, String)> = Vec::new();
+    {
+        let app_state = state.borrow();
+        for (workspace_idx, workspace) in app_state.workspaces.iter().enumerate() {
+            for pane in workspace.split_container.panes() {
+                let tab_ids = pane::tab_ids_in_pane(&pane);
+                if tab_ids.is_empty() {
+                    continue;
+                }
+                let active = pane::active_tab_id_in_pane(&pane);
+                for tab_id in tab_ids {
+                    // The active tab realizes with its workspace; visiting the
+                    // workspace at all is what it needs.
+                    if active.as_deref() == Some(tab_id.as_str()) {
+                        continue;
+                    }
+                    steps.push(EagerRestoreStep {
+                        workspace_idx,
+                        pane: pane.clone(),
+                        tab_id,
+                    });
+                }
+                if let Some(active) = active {
+                    restore.push((pane.clone(), active));
+                }
+            }
+            // Guarantee at least one visit per workspace, so single-tab panes
+            // in never-opened workspaces still spawn their agents.
+            if !steps
+                .iter()
+                .any(|step| step.workspace_idx == workspace_idx)
+            {
+                if let Some(pane) = workspace.split_container.panes().into_iter().next() {
+                    if let Some(active) = pane::active_tab_id_in_pane(&pane) {
+                        steps.push(EagerRestoreStep {
+                            workspace_idx,
+                            pane,
+                            tab_id: active,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if steps.is_empty() {
+        return;
+    }
+
+    let total = steps.len();
+    eprintln!("limux: startup eager restore sweeping {total} tabs");
+
+    let steps = Rc::new(steps);
+    let restore = Rc::new(restore);
+    let cursor = Rc::new(Cell::new(0usize));
+    let state = state.clone();
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(EAGER_RESTORE_STEP_MS),
+        move || {
+            let index = cursor.get();
+
+            if index >= steps.len() {
+                for (pane, tab_id) in restore.iter() {
+                    pane::realize_tab_in_pane_quietly(pane, tab_id);
+                }
+                {
+                    let app_state = state.borrow();
+                    if let Some(ws) = app_state.workspaces.get(original_idx) {
+                        let stack_name = format!("ws-{}", ws.id);
+                        app_state.stack.set_visible_child_name(&stack_name);
+                    }
+                }
+                eprintln!("limux: startup eager restore complete ({total} tabs)");
+                return glib::ControlFlow::Break;
+            }
+
+            let step = &steps[index];
+            {
+                let app_state = state.borrow();
+                if let Some(ws) = app_state.workspaces.get(step.workspace_idx) {
+                    let stack_name = format!("ws-{}", ws.id);
+                    app_state.stack.set_visible_child_name(&stack_name);
+                }
+            }
+            pane::realize_tab_in_pane_quietly(&step.pane, &step.tab_id);
+
+            cursor.set(index + 1);
+            glib::ControlFlow::Continue
+        },
+    );
 }
 
 /// Select a workspace by index and sync the sidebar selection.
@@ -6728,7 +7174,11 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
         (idx == s.active_idx).then(|| s.workspaces[idx].id.clone())
     };
     if let Some(workspace_id) = active_workspace_id {
-        clear_visible_tab_unread(state, &workspace_id);
+        if focus_entrypoint {
+            clear_visible_tab_unread_on_user_action(state, &workspace_id);
+        } else {
+            clear_visible_tab_unread(state, &workspace_id);
+        }
         return;
     }
 
@@ -6745,11 +7195,13 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
     };
 
     stack.set_visible_child_name(&stack_name);
-    clear_visible_tab_unread(state, &workspace_id);
     if focus_entrypoint {
+        clear_visible_tab_unread_on_user_action(state, &workspace_id);
         glib::idle_add_local_once(move || {
             focus_workspace_entrypoint(&focus_root);
         });
+    } else {
+        clear_visible_tab_unread(state, &workspace_id);
     }
 
     // If the dock toggle is parked on a pane (top-bar off, sidebar closed),
@@ -7894,6 +8346,36 @@ fn sync_workspace_unread(state: &State, ws_id: &str) {
 }
 
 fn clear_visible_tab_unread(state: &State, ws_id: &str) {
+    clear_visible_tab_unread_impl(state, ws_id, false);
+}
+
+fn clear_visible_tab_unread_on_user_action(state: &State, ws_id: &str) {
+    clear_visible_tab_unread_impl(state, ws_id, true);
+}
+
+fn clear_visible_tab_unread_impl(state: &State, ws_id: &str, user_action: bool) {
+    let root = {
+        let mut s = state.borrow_mut();
+        if !user_action && !s.window.is_active() {
+            return;
+        }
+        let Some(workspace) = s
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == ws_id)
+        else {
+            return;
+        };
+        workspace.unread = false;
+        workspace.manual_unread = false;
+        workspace.root.clone()
+    };
+    pane::clear_active_tab_unread_in_workspace(ws_id);
+    pane::clear_active_tab_unread_in_root(&root);
+    sync_workspace_unread(state, ws_id);
+}
+
+fn clear_visible_tab_unread_on_window_focus(state: &State, ws_id: &str) {
     let root = {
         let mut s = state.borrow_mut();
         if !s.window.is_active() {
@@ -7906,10 +8388,13 @@ fn clear_visible_tab_unread(state: &State, ws_id: &str) {
         else {
             return;
         };
-        workspace.unread = false;
+        if !workspace.manual_unread {
+            workspace.unread = false;
+        }
         workspace.root.clone()
     };
-    pane::clear_active_tab_unread_in_root(&root);
+    pane::clear_active_tab_unread_in_workspace_if_not_manual(ws_id);
+    pane::clear_active_tab_unread_in_root_if_not_manual(&root);
     sync_workspace_unread(state, ws_id);
 }
 
@@ -7939,6 +8424,617 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
     }
 }
 
+const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InflightTaskKind {
+    Command,
+    Timer { condition: String },
+}
+
+fn trim_json_arg_quotes(raw: &str) -> &str {
+    raw.trim().trim_matches('"')
+}
+
+fn extract_json_arg_str<'a>(
+    args: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(trim_json_arg_quotes)
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_json_arg_bool(
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<bool> {
+    if let Some(b) = args.get(key).and_then(serde_json::Value::as_bool) {
+        return Some(b);
+    }
+    match extract_json_arg_str(args, key)? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn transcript_has_inflight_background_work(transcript: &str) -> bool {
+    let lines: Vec<&str> = transcript.lines().collect();
+    let last_user_idx = lines
+        .iter()
+        .rposition(|line| line.contains("\"USER_EXPLICIT\"") && line.contains("\"USER_INPUT\""))
+        .map(|idx| idx.saturating_sub(5));
+    let first_bg_idx = lines
+        .iter()
+        .position(|line| {
+            line.contains("Tool is running as a background task with task id:")
+                || (line.contains("Task: ") && line.contains("Status:"))
+                || line.contains("Created the following subagents:")
+                || line.contains(" active subagent(s):")
+                || line.contains("\"send_message\"")
+        })
+        .map(|idx| idx.saturating_sub(5));
+    let scan_from = match (last_user_idx, first_bg_idx) {
+        (Some(u), Some(b)) => u.min(b),
+        (Some(u), None) => u,
+        (None, Some(b)) => b,
+        (None, None) => 0,
+    };
+
+    let mut steps: Vec<(usize, u64, serde_json::Value)> = lines[scan_from..]
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            let line_idx = scan_from + offset;
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let val = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            let step_index = val
+                .get("step_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(line_idx as u64);
+            Some((line_idx, step_index, val))
+        })
+        .collect();
+
+    steps.sort_by_key(|(line_idx, step_index, _)| (*step_index, *line_idx));
+
+    let start_idx = steps
+        .iter()
+        .rposition(|(_, _, val)| {
+            val.get("source").and_then(serde_json::Value::as_str) == Some("USER_EXPLICIT")
+                && val.get("type").and_then(serde_json::Value::as_str) == Some("USER_INPUT")
+        })
+        .unwrap_or(0);
+
+    let mut active_tasks: HashMap<String, InflightTaskKind> = HashMap::new();
+    let mut active_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending_planner_response = false;
+    let mut last_schedule_is_daemon = false;
+    let mut last_schedule_condition = "never".to_string();
+    let mut last_command_is_daemon = false;
+
+    for (step_idx, (_, _, step)) in steps.iter().enumerate() {
+        let step_type = step
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let status = step
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        match step_type {
+            "PLANNER_RESPONSE" => {
+                if step_idx >= start_idx {
+                    pending_planner_response = status == "PENDING";
+                }
+                last_schedule_is_daemon = false;
+                last_schedule_condition = "never".to_string();
+                last_command_is_daemon = false;
+                if let Some(tool_calls) = step
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for call in tool_calls {
+                        let name = call
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let Some(args) = call.get("args").and_then(serde_json::Value::as_object)
+                        else {
+                            continue;
+                        };
+                        match name {
+                            "schedule" => {
+                                last_schedule_is_daemon =
+                                    extract_json_arg_bool(args, "IsDaemon").unwrap_or(false);
+                                last_schedule_condition =
+                                    extract_json_arg_str(args, "TimerCondition")
+                                        .unwrap_or("never")
+                                        .to_string();
+                            }
+                            "run_command" => {
+                                last_command_is_daemon =
+                                    extract_json_arg_bool(args, "IsDaemon").unwrap_or(false);
+                            }
+                            "send_message" => {
+                                if let Some(recipient) = extract_json_arg_str(args, "Recipient") {
+                                    active_subagents.insert(recipient.to_string());
+                                }
+                            }
+                            "manage_subagents" => {
+                                if extract_json_arg_str(args, "Action") == Some("kill_all") {
+                                    active_subagents.clear();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "GENERIC" => {
+                if step_idx >= start_idx {
+                    pending_planner_response = false;
+                }
+                let content = step
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+
+                if let Some(rest) =
+                    content.split("Tool is running as a background task with task id: ").nth(1)
+                {
+                    if let Some(task_id) = rest.lines().next().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        let is_timer = content.contains("\nTask Description: Timer:");
+                        if is_timer {
+                            let condition = std::mem::replace(
+                                &mut last_schedule_condition,
+                                "never".to_string(),
+                            );
+                            if !last_schedule_is_daemon {
+                                active_tasks.insert(
+                                    task_id.to_string(),
+                                    InflightTaskKind::Timer { condition },
+                                );
+                            }
+                            last_schedule_is_daemon = false;
+                        } else {
+                            if !last_command_is_daemon {
+                                active_tasks.insert(task_id.to_string(), InflightTaskKind::Command);
+                            }
+                            last_command_is_daemon = false;
+                        }
+                    }
+                }
+
+                if let Some(rest) = content.split("Task \"").nth(1) {
+                    if let Some((task_id, after)) = rest.split_once('"') {
+                        if after.starts_with(" cancelled.") {
+                            active_tasks.remove(task_id.trim());
+                        }
+                    }
+                }
+
+                if let Some(rest) = content.split("Task: ").nth(1) {
+                    let mut lines = rest.lines();
+                    if let Some(task_id) = lines.next().map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Some(status_line) =
+                            lines.find(|line| line.trim_start().starts_with("Status:"))
+                        {
+                            let task_status = status_line
+                                .trim_start()
+                                .trim_start_matches("Status:")
+                                .trim();
+                            if task_status == "RUNNING" {
+                                active_tasks
+                                    .entry(task_id.to_string())
+                                    .or_insert(InflightTaskKind::Command);
+                            } else if matches!(
+                                task_status,
+                                "DONE"
+                                    | "ERROR"
+                                    | "CANCELED"
+                                    | "CANCELLED"
+                                    | "KILLED"
+                                    | "TERMINATED"
+                            ) {
+                                active_tasks.remove(task_id);
+                            }
+                        }
+                    }
+                }
+
+                if content.contains("Created the following subagents:") {
+                    for line in content.lines() {
+                        if let Some(rest) = line.split("\"conversationId\":").nth(1) {
+                            let sub_id = trim_json_arg_quotes(rest.trim().trim_end_matches(','));
+                            if !sub_id.is_empty() {
+                                active_subagents.insert(sub_id.to_string());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(json_start) = content
+                    .find(" active subagent(s):\n[")
+                    .map(|idx| idx + " active subagent(s):\n".len())
+                {
+                    if let Ok(list) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(content[json_start..].trim())
+                    {
+                        for item in list {
+                            let Some(sub_id) = item
+                                .get("conversationId")
+                                .and_then(serde_json::Value::as_str)
+                            else {
+                                continue;
+                            };
+                            let state = item
+                                .get("state")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            match state {
+                                "running" | "waiting_for_dependents" => {
+                                    active_subagents.insert(sub_id.to_string());
+                                }
+                                "idle" | "errored" | "canceling" | "waiting_for_message" => {
+                                    active_subagents.remove(sub_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                if step_idx >= start_idx {
+                    pending_planner_response = false;
+                }
+                let content = step
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+
+                let sender = content
+                    .split("sender=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(str::trim)
+                    .unwrap_or("");
+
+                if !sender.is_empty() {
+                    active_tasks.retain(|_, kind| match kind {
+                        InflightTaskKind::Timer { condition } => {
+                            condition != "any" && condition != sender
+                        }
+                        InflightTaskKind::Command => true,
+                    });
+
+                    if let Some(kind) = active_tasks.get(sender).cloned() {
+                        match kind {
+                            InflightTaskKind::Timer { .. } => {
+                                active_tasks.remove(sender);
+                            }
+                            InflightTaskKind::Command => {
+                                if !content.contains("is still running") {
+                                    active_tasks.remove(sender);
+                                }
+                            }
+                        }
+                    }
+
+                    active_subagents.remove(sender);
+                }
+
+                if let Some(rest) = content.split("Task id \"").nth(1) {
+                    if let Some((task_id, _)) = rest.split_once('"') {
+                        if !content.contains("is still running") {
+                            active_tasks.remove(task_id.trim());
+                        }
+                    }
+                }
+
+                if let Some(rest) = content.split("Subagent ").nth(1) {
+                    if let Some((sub_id, _)) = rest.split_once(" has gone idle") {
+                        active_subagents.remove(sub_id.trim());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pending_planner_response || !active_tasks.is_empty() || !active_subagents.is_empty()
+}
+
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let offset = len.saturating_sub(MAX_TRANSCRIPT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = Vec::with_capacity((len - offset) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if offset > 0 {
+        if let Some(newline_idx) = text.find('\n') {
+            return Some(text[newline_idx + 1..].to_string());
+        }
+    }
+    Some(text)
+}
+
+fn jetski_brain_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gemini/jetski/brain"))
+}
+
+fn jetski_presence_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".gemini/jetski/presence"))
+}
+
+thread_local! {
+    static DISCOVERED_TAB_SESSIONS: RefCell<HashMap<(String, u32, String), (u32, String)>> =
+        RefCell::new(HashMap::new());
+}
+
+fn is_presence_lock_actively_held(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    matches!(
+        file.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
+}
+
+fn sid_has_active_presence_lock(sid: &str) -> bool {
+    jetski_presence_dir()
+        .is_some_and(|dir| is_presence_lock_actively_held(&dir.join(format!("{sid}.lock"))))
+        || jetski_brain_dir()
+            .is_some_and(|dir| is_presence_lock_actively_held(&dir.join(sid).join("presence.lock")))
+}
+
+fn is_pid_running_not_stopped(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let state = stat[rparen + 1..].trim_start().chars().next().unwrap_or('Z');
+    !matches!(state, 'T' | 't' | 'Z' | 'X')
+}
+
+fn discover_live_jetski_session_for_tab(
+    workspace_id: &str,
+    pane_id: u32,
+    tab_id: &str,
+) -> (Option<(u32, String)>, bool) {
+    let tab_needle = format!("LIMUX_TAB_ID={tab_id}\0");
+    let surface_needle = format!("LIMUX_SURFACE_ID={pane_id}:{tab_id}\0");
+    let ws_needle = format!("LIMUX_WORKSPACE_ID={workspace_id}\0");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return (None, false);
+    };
+
+    let current_uid = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m));
+    let mut has_live_jetski = false;
+    let mut fallback_db_session: Option<(u32, String)> = None;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if let Some(uid) = current_uid {
+            if !entry
+                .metadata()
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == uid)
+            {
+                continue;
+            }
+        }
+        if !is_pid_running_not_stopped(pid) {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let Ok(environ_bytes) = std::fs::read(proc_dir.join("environ")) else {
+            continue;
+        };
+        let environ = String::from_utf8_lossy(&environ_bytes);
+        if !environ.contains(&tab_needle) && !environ.contains(&surface_needle) {
+            continue;
+        }
+        if !workspace_id.is_empty()
+            && environ.contains("LIMUX_WORKSPACE_ID=")
+            && !environ.contains(&ws_needle)
+        {
+            continue;
+        }
+
+        if let Ok(fds) = std::fs::read_dir(proc_dir.join("fd")) {
+            let mut fd_entries: Vec<(u32, PathBuf)> = fds
+                .flatten()
+                .filter_map(|fd| {
+                    let fd_num = fd.file_name().to_str()?.parse::<u32>().ok()?;
+                    Some((fd_num, fd.path()))
+                })
+                .collect();
+            fd_entries.sort_by_key(|(fd_num, _)| *fd_num);
+
+            for (_, fd_path) in fd_entries {
+                let Ok(target) = std::fs::read_link(fd_path) else {
+                    continue;
+                };
+                let target_str = target.to_string_lossy();
+                if let Some(rest) = target_str.rsplit_once("/presence/") {
+                    if let Some(conv_id) = rest.1.strip_suffix(".lock") {
+                        if !conv_id.is_empty() && !conv_id.contains('/') {
+                            return (Some((pid, conv_id.to_string())), true);
+                        }
+                    }
+                }
+                if let Some(rest) = target_str.split("/.gemini/jetski/brain/").nth(1) {
+                    if let Some(conv_id) = rest.strip_suffix("/presence.lock") {
+                        if !conv_id.is_empty() && !conv_id.contains('/') {
+                            return (Some((pid, conv_id.to_string())), true);
+                        }
+                    }
+                }
+                if fallback_db_session.is_none() {
+                    if let Some(rest) = target_str.rsplit_once("/conversations/") {
+                        if let Some(conv_id) = rest.1.strip_suffix(".db") {
+                            if !conv_id.is_empty() && !conv_id.contains('/') {
+                                fallback_db_session = Some((pid, conv_id.to_string()));
+                                has_live_jetski = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) {
+            let cmd_str = String::from_utf8_lossy(&cmdline);
+            if cmd_str.contains("app_data_dir=jetski")
+                || cmd_str.contains("jetski")
+                || cmd_str.contains("cli_custom")
+            {
+                has_live_jetski = true;
+            }
+        }
+    }
+
+    (fallback_db_session, has_live_jetski)
+}
+
+fn resolve_agent_session_id_for_tab(
+    ws_id: &str,
+    pane_id: u32,
+    tab_id: &str,
+) -> (Option<String>, bool) {
+    let cache_key = (ws_id.to_string(), pane_id, tab_id.to_string());
+    let discovered = DISCOVERED_TAB_SESSIONS.with(|map| map.borrow().get(&cache_key).cloned());
+    if let Some((pid, sid)) = discovered {
+        if is_pid_running_not_stopped(pid) && sid_has_active_presence_lock(&sid) {
+            return (Some(sid), true);
+        }
+    }
+
+    let static_session_id =
+        pane::tab_agent_session_id_in_workspace(ws_id, pane_id, tab_id).or_else(|| {
+            layout_state::RestorableAgentIndex::load()
+                .agent_for_surface(ws_id, Some(pane_id), tab_id)
+                .map(|agent| agent.session_id)
+        });
+
+    if let Some(ref sid) = static_session_id {
+        if sid_has_active_presence_lock(sid) {
+            return (Some(sid.clone()), true);
+        }
+    }
+
+    let (proc_session, proc_live_jetski) =
+        discover_live_jetski_session_for_tab(ws_id, pane_id, tab_id);
+    if let Some((pid, sid)) = proc_session {
+        DISCOVERED_TAB_SESSIONS.with(|map| {
+            map.borrow_mut().insert(cache_key, (pid, sid.clone()));
+        });
+        return (Some(sid), true);
+    }
+
+    DISCOVERED_TAB_SESSIONS.with(|map| {
+        map.borrow_mut().remove(&cache_key);
+    });
+    (static_session_id, proc_live_jetski)
+}
+
+fn tab_has_inflight_agent_work_for_session(session_id: &str) -> bool {
+    let Some(brain_dir) = jetski_brain_dir() else {
+        return false;
+    };
+    let transcript_path = brain_dir
+        .join(session_id)
+        .join(".system_generated/logs/transcript.jsonl");
+    let Some(tail) = read_transcript_tail(&transcript_path) else {
+        return false;
+    };
+    transcript_has_inflight_background_work(&tail)
+}
+
+fn should_suppress_tab_notification(
+    ws_id: &str,
+    pane_id: u32,
+    tab_id: &str,
+    message: &str,
+) -> bool {
+    if message.contains("needs tool confirmation") || message.contains("needs you") {
+        return false;
+    }
+    if message.starts_with("Gemini session started")
+        || message.starts_with("Gemini session ended")
+        || message.starts_with("Gemini: Cleanup")
+        || message.starts_with("Gemini: cleanup")
+        || message.starts_with("Gemini: restore-exit")
+        || message.starts_with("Gemini: session-start")
+        || message.starts_with("Gemini: session-end")
+        || message.starts_with("Gemini: prompt-submit")
+        || message.starts_with("Gemini: new prompt")
+        || message.starts_with("Gemini: PreToolUse")
+        || message.starts_with("Gemini: PostToolUse")
+        || message.starts_with("Gemini: SubagentStop")
+    {
+        return true;
+    }
+    if message == "Process needs attention" {
+        let (session_id, is_live_jetski) = resolve_agent_session_id_for_tab(ws_id, pane_id, tab_id);
+        return is_live_jetski
+            || session_id
+                .as_deref()
+                .is_some_and(tab_has_inflight_agent_work_for_session);
+    }
+    if message.contains("is ready for input")
+        || message.starts_with("Gemini finished")
+        || message.starts_with("Gemini: ")
+    {
+        let (Some(parent_session_id), _) = resolve_agent_session_id_for_tab(ws_id, pane_id, tab_id)
+        else {
+            return false;
+        };
+        // If the notification came from `limux hooks gemini stop`, its message has the form
+        // "Gemini: stop: <8-char-session-prefix>" or "Gemini finished: <8-char-session-prefix> — ...".
+        // Subagents run in the same process tree and inherit LIMUX_SURFACE_ID, so a subagent
+        // finishing a turn emits a hook event with its own session_id prefix. Suppress any hook
+        // notification whose session prefix does not match the parent conversation in this tab.
+        if let Some(rest) = message
+            .strip_prefix("Gemini: stop: ")
+            .or_else(|| message.strip_prefix("Gemini: Stop: "))
+            .or_else(|| message.strip_prefix("Gemini finished: "))
+        {
+            let hook_prefix = rest
+                .split([' ', '—', ':'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if hook_prefix.len() >= 6 && !parent_session_id.starts_with(hook_prefix) {
+                return true;
+            }
+        }
+        return tab_has_inflight_agent_work_for_session(&parent_session_id);
+    }
+    false
+}
+
 fn mark_workspace_unread_with_message(
     state: &State,
     ws_id: &str,
@@ -7946,6 +9042,11 @@ fn mark_workspace_unread_with_message(
     source_focused: bool,
     target: DesktopNotificationTarget,
 ) -> Option<DesktopNotificationRequest> {
+    if let (Some(pane_id), Some(tab_id)) = (target.pane_id, target.tab_id.as_deref()) {
+        if should_suppress_tab_notification(ws_id, pane_id, tab_id, message) {
+            return None;
+        }
+    }
     let (workspace_idx, active_idx, workspace_name, window_active, notifications) = {
         let s = state.borrow();
         let workspace_idx = s
@@ -8087,6 +9188,51 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 }
 
 #[cfg(test)]
+pub(crate) fn run_on_gtk_test_thread<F: FnOnce() + Send + 'static>(f: F) {
+    use std::sync::{mpsc, OnceLock};
+
+    type Task = Box<dyn FnOnce() + Send + 'static>;
+    static SENDER: OnceLock<Option<mpsc::Sender<Task>>> = OnceLock::new();
+
+    let sender = SENDER.get_or_init(|| {
+        let (init_tx, init_rx) = mpsc::channel();
+        let (task_tx, task_rx) = mpsc::channel::<Task>();
+        std::thread::spawn(move || {
+            if gtk::init().is_err() {
+                let _ = init_tx.send(false);
+                return;
+            }
+            let _ = init_tx.send(true);
+            while let Ok(task) = task_rx.recv() {
+                task();
+            }
+        });
+        if init_rx.recv().unwrap_or(false) {
+            Some(task_tx)
+        } else {
+            None
+        }
+    });
+
+    let Some(sender) = sender else {
+        return;
+    };
+
+    let (done_tx, done_rx) = mpsc::channel();
+    sender
+        .send(Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = done_tx.send(result);
+        }))
+        .expect("GTK test thread stopped unexpectedly");
+
+    match done_rx.recv().expect("GTK test task did not complete") {
+        Ok(()) => {}
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -8095,6 +9241,7 @@ mod tests {
     use super::gtk;
     use super::gtk::ffi;
     use super::gtk::gdk;
+    use super::run_on_gtk_test_thread;
     use super::ToVariant;
     use gtk::prelude::*;
 
@@ -8129,7 +9276,8 @@ mod tests {
         resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        should_emit_desktop_notification, should_trigger_workspace_double_click_rename,
+        tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_autostart_dialog_dismisses,
         workspace_drop_layout_path, workspace_folder_path_from_input,
         workspace_notification_message, workspace_path_visible, Direction, EditableCaptureContext,
@@ -9170,55 +10318,571 @@ mod tests {
 
     #[test]
     fn find_leaf_pane_descends_into_non_pane_boxes() {
-        use gtk4::prelude::{BoxExt, Cast, WidgetExt};
+        run_on_gtk_test_thread(|| {
+            use gtk4::prelude::{BoxExt, Cast, WidgetExt};
 
-        // GTK widget tests need a display. Skip silently on headless CI.
-        if gtk4::init().is_err() {
-            return;
-        }
+            let make_pane = || {
+                let pane = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                header.add_css_class("limux-pane-header");
+                pane.append(&header);
+                pane
+            };
 
-        let make_pane = || {
-            let pane = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-            let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            header.add_css_class("limux-pane-header");
-            pane.append(&header);
-            pane
-        };
+            // A plain Box wrapping a single child simulates a SplitTreeContainer bin.
+            let bin = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let inner_pane = make_pane();
+            bin.append(&inner_pane);
 
-        // A plain Box wrapping a single child simulates a SplitTreeContainer bin.
-        let bin = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        let inner_pane = make_pane();
-        bin.append(&inner_pane);
+            let leaf = find_leaf_pane(&bin.upcast(), gtk4::Orientation::Horizontal, true);
+            assert_eq!(
+                leaf,
+                inner_pane.clone().upcast::<gtk4::Widget>(),
+                "find_leaf_pane should descend through a non-pane Box"
+            );
 
-        let leaf = find_leaf_pane(&bin.upcast(), gtk4::Orientation::Horizontal, true);
-        assert_eq!(
-            leaf,
-            inner_pane.clone().upcast::<gtk4::Widget>(),
-            "find_leaf_pane should descend through a non-pane Box"
+            // A Box that is a pane widget should be returned as-is.
+            let pane = make_pane();
+
+            let leaf = find_leaf_pane(&pane.clone().upcast(), gtk4::Orientation::Horizontal, true);
+            assert_eq!(
+                leaf,
+                pane.clone().upcast::<gtk4::Widget>(),
+                "find_leaf_pane should treat a pane Box as a leaf"
+            );
+
+            // A Paned should descend to its actual leaf.
+            let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+            let left_pane = make_pane();
+            paned.set_start_child(Some(&left_pane));
+            paned.set_end_child(Some(&make_pane()));
+
+            let leaf = find_leaf_pane(&paned.upcast(), gtk4::Orientation::Horizontal, true);
+            assert_eq!(
+                leaf,
+                left_pane.clone().upcast::<gtk4::Widget>(),
+                "find_leaf_pane should descend through a Paned to its leaf"
+            );
+        });
+    }
+
+    #[test]
+    fn workspace_double_click_rename_guards_against_single_click_active_rename_and_favorite_button()
+    {
+        assert!(should_trigger_workspace_double_click_rename(
+            2, false, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            1, false, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            2, true, false
+        ));
+        assert!(!should_trigger_workspace_double_click_rename(
+            2, false, true
+        ));
+    }
+
+    #[test]
+    fn workspace_context_menu_mark_as_unread_preserves_active_workspace_and_manual_unread() {
+        run_on_gtk_test_thread(|| {
+            use super::*;
+
+            let app = adw::Application::new(
+                Some("com.limux.test.unread"),
+                gio::ApplicationFlags::NON_UNIQUE,
+            );
+            let window = adw::ApplicationWindow::builder().build();
+            let sidebar_list = gtk::ListBox::new();
+            let stack = gtk::Stack::new();
+
+            let state: State = Rc::new(RefCell::new(AppState {
+                app,
+                window,
+                top_bar: None,
+                top_bar_content: None,
+                top_bar_minimize_btn: None,
+                top_bar_maximize_btn: None,
+                top_bar_close_btn: None,
+                sidebar_toggle: None,
+                top_bar_new_ws_btn_ref: None,
+                top_bar_settings_btn: None,
+                sidebar_header: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                sidebar_header_handle: gtk::WindowHandle::new(),
+                sidebar_drag_area: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                top_bar_visible: true,
+                config: Rc::new(RefCell::new(app_config::AppConfig::default())),
+                css_provider: gtk::CssProvider::new(),
+                system_prefers_dark: Rc::new(Cell::new(None)),
+                workspaces: Vec::new(),
+                active_idx: 0,
+                shortcuts: Rc::new(crate::shortcut_config::resolve_shortcuts_from_str("{}").unwrap()),
+                stack: stack.clone(),
+                sidebar_list: sidebar_list.clone(),
+                sidebar_shell: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                sidebar_handle: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                new_ws_btn: gtk::Button::new(),
+                indicator_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                indicator_scroll: gtk::ScrolledWindow::new(),
+                sidebar_animation: None,
+                sidebar_animation_epoch: 0,
+                sidebar_expanded_width: 220,
+                persistence_suspended: true,
+                suppress_row_selection: false,
+                save_queued: false,
+                session_store: Err("not used in test".to_string()),
+                session_save_notice: None,
+                session_close_dialog_open: false,
+                close_after_recovery: false,
+                workspace_dragging: None,
+                desktop_notification_routes: HashMap::new(),
+                _theme_portal_signal: None,
+                _theme_gnome_settings: None,
+                _theme_gnome_signal: None,
+                _desktop_notification_token_signal: None,
+                _desktop_notification_action_signal: None,
+                _desktop_notification_closed_signal: None,
+            }));
+
+            let make_ws = |id: &str, name: &str| {
+                let dummy_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let split_container = SplitTreeContainer::new(&state, dummy_pane.upcast());
+                let root = split_container.widget().clone();
+                stack.add_named(&root, Some(&format!("ws-{id}")));
+                let row = gtk::ListBoxRow::new();
+                sidebar_list.append(&row);
+                Workspace {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    root: root.upcast(),
+                    split_container,
+                    sidebar_row: row,
+                    name_label: gtk::Label::new(Some(name)),
+                    favorite_button: gtk::Button::new(),
+                    notify_dot: gtk::Label::new(Some("•")),
+                    notify_label: gtk::Label::new(None),
+                    unread: false,
+                    manual_unread: false,
+                    favorite: false,
+                    color: None,
+                    cwd: Rc::new(RefCell::new(None)),
+                    folder_path: None,
+                    autostart_command: Rc::new(RefCell::new(None)),
+                    path_label: gtk::Label::new(None),
+                    indicator_button: gtk::Button::new(),
+                    indicator_unread_dot: gtk::Label::new(Some("•")),
+                }
+            };
+
+            let ws0 = make_ws("ws-0", "Workspace 0");
+            let ws1 = make_ws("ws-1", "Workspace 1");
+            let row0 = ws0.sidebar_row.clone();
+            let row1 = ws1.sidebar_row.clone();
+            state.borrow_mut().workspaces = vec![ws0, ws1];
+            sidebar_list.select_row(Some(&row0));
+
+            {
+                let state = state.clone();
+                sidebar_list.connect_row_selected(move |list, row| {
+                    let Some(row) = row else {
+                        return;
+                    };
+                    let (suppress, active_row, idx) = {
+                        let s = state.borrow();
+                        let idx = row.index() as usize;
+                        let suppress = s.suppress_row_selection
+                            || pane::widget_has_open_popover(row.upcast_ref());
+                        let active_row = s
+                            .workspaces
+                            .get(s.active_idx)
+                            .map(|ws| ws.sidebar_row.clone());
+                        (suppress, active_row, idx)
+                    };
+                    if suppress {
+                        if let Some(active_row) = active_row {
+                            if &active_row != row {
+                                state.borrow_mut().suppress_row_selection = true;
+                                list.select_row(Some(&active_row));
+                                state.borrow_mut().suppress_row_selection = false;
+                            }
+                        }
+                        return;
+                    }
+                    switch_workspace(&state, idx);
+                });
+            }
+
+            // Open right-click context menu on background workspace row1.
+            show_workspace_context_menu(&state, "ws-1", &row1);
+            assert!(
+                pane::widget_has_open_popover(row1.upcast_ref()),
+                "row1 should report an open popover"
+            );
+
+            // Simulate GtkListBox trying to select row1 during button release while popover is open.
+            sidebar_list.select_row(Some(&row1));
+            assert_eq!(
+                state.borrow().active_idx,
+                0,
+                "selecting row while popover is open must not switch active workspace"
+            );
+
+            // Find and click Mark as Unread button in the popover.
+            let popover = row1
+                .first_child()
+                .and_then(|w| {
+                    let mut cur = Some(w);
+                    while let Some(c) = cur {
+                        if let Ok(p) = c.clone().downcast::<gtk::Popover>() {
+                            return Some(p);
+                        }
+                        cur = c.next_sibling();
+                    }
+                    None
+                })
+                .expect("popover child on row1");
+            let menu_box = popover
+                .child()
+                .and_then(|w| w.downcast::<gtk::Box>().ok())
+                .expect("menu box in popover");
+            let unread_btn = menu_box
+                .first_child()
+                .and_then(|w| w.downcast::<gtk::Button>().ok())
+                .expect("unread button");
+            assert_eq!(unread_btn.label().as_deref(), Some("Mark as Unread"));
+
+            unread_btn.emit_clicked();
+            while glib::MainContext::default().iteration(false) {}
+
+            {
+                let s = state.borrow();
+                assert_eq!(s.active_idx, 0, "active workspace must remain 0");
+                assert!(
+                    s.workspaces[1].unread && s.workspaces[1].manual_unread,
+                    "workspace 1 should be marked unread and manual_unread"
+                );
+                assert!(
+                    s.workspaces[1].notify_dot.is_visible(),
+                    "workspace 1 notify_dot should be visible"
+                );
+            }
+
+            // Window focus events must NOT clear manual_unread.
+            clear_visible_tab_unread_on_window_focus(&state, "ws-1");
+            {
+                let s = state.borrow();
+                assert!(
+                    s.workspaces[1].unread && s.workspaces[1].manual_unread,
+                    "window focus must not clear manual_unread"
+                );
+            }
+
+            // Explicit user click action MUST clear manual_unread even if window is inactive.
+            clear_visible_tab_unread_on_user_action(&state, "ws-1");
+            {
+                let s = state.borrow();
+                assert!(
+                    !s.workspaces[1].unread && !s.workspaces[1].manual_unread,
+                    "explicit user action must clear manual_unread even when window is inactive"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn transcript_inflight_work_tracks_background_command_and_still_running_wakeups() {
+        // Out-of-order logging where GENERIC (step 2) is written before PLANNER_RESPONSE (step 1).
+        let mut transcript = String::from(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"build it"}
+{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Created At: 2026-09-29T19:38:44Z\nTool is running as a background task with task id: conv-1/task-378\nTask Description: blaze test //...\n"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"blaze test //...\""}}]}
+{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Running tests in the background..."}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "background command in flight must suppress ready-for-input unread"
         );
 
-        // A Box that is a pane widget should be returned as-is.
-        let pane = make_pane();
-
-        let leaf = find_leaf_pane(&pane.clone().upcast(), gtk4::Orientation::Horizontal, true);
-        assert_eq!(
-            leaf,
-            pane.clone().upcast::<gtk4::Widget>(),
-            "find_leaf_pane should treat a pane Box as a leaf"
+        // "is still running" wakeup must NOT clear the in-flight task.
+        transcript.push_str(
+            r#"{"step_index":4,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-09-29T19:40:00Z sender=conv-1/task-378 priority=MESSAGE_PRIORITY_HIGH content=Task id \"conv-1/task-378\" is still running."}
+{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Still waiting on blaze test..."}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "still-running notification must keep background task active"
         );
 
-        // A Paned should descend to its actual leaf.
-        let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
-        let left_pane = make_pane();
-        paned.set_start_child(Some(&left_pane));
-        paned.set_end_child(Some(&make_pane()));
-
-        let leaf = find_leaf_pane(&paned.upcast(), gtk4::Orientation::Horizontal, true);
-        assert_eq!(
-            leaf,
-            left_pane.clone().upcast::<gtk4::Widget>(),
-            "find_leaf_pane should descend through a Paned to its leaf"
+        // Final completion wakeup clears the task so the final response notifies the user.
+        transcript.push_str(
+            r#"{"step_index":6,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-09-29T19:43:20Z sender=conv-1/task-378 priority=MESSAGE_PRIORITY_HIGH content=Task id \"conv-1/task-378\" finished with result:\nThe command exited with code 0."}
+{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"All tests passed!"}
+"#,
         );
+        assert!(
+            !super::transcript_has_inflight_background_work(&transcript),
+            "completed background task must allow unread notification"
+        );
+    }
+
+    #[test]
+    fn transcript_inflight_work_tracks_timers_and_early_termination_conditions() {
+        let mut transcript = String::from(
+            r#"{"step_index":10,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"fix presubmit"}
+{"step_index":11,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"edacloud wait\""}}]}
+{"step_index":12,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: conv-2/task-100\nTask Description: edacloud wait\n"}
+{"step_index":13,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"schedule","args":{"DurationSeconds":"300","Prompt":"\"Check status\"","TimerCondition":"\"conv-2/task-100\""}}]}
+{"step_index":14,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: conv-2/task-101\nTask Description: Timer: Check status\n"}
+{"step_index":15,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for job or timer..."}
+"#,
+        );
+        assert!(super::transcript_has_inflight_background_work(&transcript));
+
+        // When conv-2/task-100 finishes early, it also early-cancels timer conv-2/task-101!
+        transcript.push_str(
+            r#"{"step_index":16,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-09-29T19:45:00Z sender=conv-2/task-100 priority=MESSAGE_PRIORITY_HIGH content=Task id \"conv-2/task-100\" finished with result:\nDone"}
+{"step_index":17,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Presubmit job finished!"}
+"#,
+        );
+        assert!(
+            !super::transcript_has_inflight_background_work(&transcript),
+            "early-cancelled timer must not block unread once the target task finishes"
+        );
+    }
+
+    #[test]
+    fn transcript_inflight_work_tracks_subagents_and_wakeups() {
+        let mut transcript = String::from(
+            r#"{"step_index":20,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"audit shells"}
+{"step_index":21,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"invoke_subagent","args":{}}]}
+{"step_index":22,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created the following subagents:\n{\n  \"conversationId\":  \"sub-uuid-1\",\n  \"role\":  \"Auditor\"\n}"}
+{"step_index":23,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for subagent..."}
+"#,
+        );
+        assert!(super::transcript_has_inflight_background_work(&transcript));
+
+        // Subagent replies via SYSTEM_MESSAGE.
+        transcript.push_str(
+            r#"{"step_index":24,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-09-29T19:50:00Z sender=sub-uuid-1 priority=MESSAGE_PRIORITY_NORMAL content=Audit complete."}
+{"step_index":25,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Here are the audit results."}
+"#,
+        );
+        assert!(!super::transcript_has_inflight_background_work(&transcript));
+    }
+
+    #[test]
+    fn presence_lock_liveness_rejects_unlocked_orphan_and_accepts_flocked_file() {
+        let temp_dir = std::env::temp_dir().join(format!("limux_a3_lock_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let orphan_lock = temp_dir.join("orphan.lock");
+        std::fs::write(&orphan_lock, b"").expect("write orphan lock");
+
+        // An unlocked 0-byte orphan .lock file on disk MUST return false.
+        assert!(
+            !super::is_presence_lock_actively_held(&orphan_lock),
+            "unlocked orphan .lock file must not be treated as an active presence lock"
+        );
+
+        // When a process holds an exclusive flock (LOCK_EX) on the file, it MUST return true.
+        let held_file = std::fs::File::open(&orphan_lock).expect("open lock file");
+        held_file.try_lock().expect("acquire exclusive flock");
+        assert!(
+            super::is_presence_lock_actively_held(&orphan_lock),
+            "exclusively flocked .lock file must be recognized as actively held"
+        );
+        drop(held_file);
+
+        // Once the holder drops the file descriptor, liveness MUST immediately return false.
+        assert!(
+            !super::is_presence_lock_actively_held(&orphan_lock),
+            "dropping the exclusive flock holder must immediately clear liveness"
+        );
+
+        // Current test runner process is running and not stopped.
+        assert!(super::is_pid_running_not_stopped(std::process::id()));
+        assert!(!super::is_pid_running_not_stopped(u32::MAX));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn transcript_inflight_work_preserves_cross_turn_background_tasks_and_subagents() {
+        // Turn 1 spawns a background task (conv-x/task-42) and a subagent (sub-x-1), followed
+        // by >8 intermediate steps and turns so last_user_idx (idx.saturating_sub(5)) > first_bg_idx.
+        let mut transcript = String::from(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start background build and audit"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"cargo test\"","IsDaemon":false}},{"name":"invoke_subagent","args":{}}]}
+{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: conv-x/task-42\nTask Description: cargo test\n"}
+{"step_index":3,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created the following subagents:\n{\n  \"conversationId\": \"sub-x-1\",\n  \"role\": \"Auditor\"\n}"}
+{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Started both in background."}
+{"step_index":5,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 2 question 1"}
+{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 2 answer 1"}
+{"step_index":7,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 3 question 2"}
+{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 3 answer 2"}
+{"step_index":9,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 4 question 3"}
+{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 4 answer 3"}
+{"step_index":11,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"turn 5 question 4"}
+{"step_index":12,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"turn 5 answer 4"}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "background task and subagent from Turn 1 must remain tracked across >10 lines and multiple USER_INPUT turns"
+        );
+
+        // Task finishes, subagent still running -> still true.
+        transcript.push_str(
+            r#"{"step_index":13,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-10-06T21:00:00Z sender=conv-x/task-42 priority=MESSAGE_PRIORITY_HIGH content=Task id \"conv-x/task-42\" finished with result:\nDone"}
+{"step_index":14,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Build finished, waiting for subagent."}
+"#,
+        );
+        assert!(
+            super::transcript_has_inflight_background_work(&transcript),
+            "subagent from Turn 1 must still keep inflight work true after task finishes"
+        );
+
+        // Subagent finishes -> now false.
+        transcript.push_str(
+            r#"{"step_index":15,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] timestamp=2026-10-06T21:01:00Z sender=sub-x-1 priority=MESSAGE_PRIORITY_HIGH content=Audit complete."}
+{"step_index":16,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"All done!"}
+"#,
+        );
+        assert!(
+            !super::transcript_has_inflight_background_work(&transcript),
+            "once both cross-turn task and subagent complete, inflight work must be false"
+        );
+    }
+
+    #[test]
+    fn workspace_reorder_favorite_and_close_never_double_borrow_state_on_widget_remove() {
+        use super::*;
+
+        run_on_gtk_test_thread(|| {
+            let app = adw::Application::builder()
+                .application_id("com.limux.test.drag.reentrancy")
+                .build();
+            let window = adw::ApplicationWindow::builder().application(&app).build();
+            let sidebar_list = gtk::ListBox::new();
+            let indicator_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let stack = gtk::Stack::new();
+
+            let state: State = Rc::new(RefCell::new(AppState {
+                app,
+                window,
+                top_bar: None,
+                top_bar_content: None,
+                top_bar_minimize_btn: None,
+                top_bar_maximize_btn: None,
+                top_bar_close_btn: None,
+                sidebar_toggle: None,
+                top_bar_new_ws_btn_ref: None,
+                top_bar_settings_btn: None,
+                sidebar_header: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                sidebar_header_handle: gtk::WindowHandle::new(),
+                sidebar_drag_area: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                top_bar_visible: true,
+                config: Rc::new(RefCell::new(app_config::AppConfig::default())),
+                css_provider: gtk::CssProvider::new(),
+                system_prefers_dark: Rc::new(Cell::new(None)),
+                workspaces: Vec::new(),
+                active_idx: 0,
+                shortcuts: Rc::new(
+                    crate::shortcut_config::resolve_shortcuts_from_str("{}").unwrap(),
+                ),
+                stack: stack.clone(),
+                sidebar_list: sidebar_list.clone(),
+                sidebar_shell: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                sidebar_handle: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                new_ws_btn: gtk::Button::new(),
+                indicator_box: indicator_box.clone(),
+                indicator_scroll: gtk::ScrolledWindow::new(),
+                sidebar_animation: None,
+                sidebar_animation_epoch: 0,
+                sidebar_expanded_width: 220,
+                persistence_suspended: true,
+                suppress_row_selection: false,
+                save_queued: false,
+                session_store: Err("not used in test".to_string()),
+                session_save_notice: None,
+                session_close_dialog_open: false,
+                close_after_recovery: false,
+                workspace_dragging: Some("ws-0".to_string()),
+                desktop_notification_routes: HashMap::new(),
+                _theme_portal_signal: None,
+                _theme_gnome_settings: None,
+                _theme_gnome_signal: None,
+                _desktop_notification_token_signal: None,
+                _desktop_notification_action_signal: None,
+                _desktop_notification_closed_signal: None,
+            }));
+
+            let reentrant_borrows = Rc::new(Cell::new(0usize));
+
+            let make_ws = |id: &str, name: &str| {
+                let dummy_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let split_container = SplitTreeContainer::new(&state, dummy_pane.upcast());
+                let root = split_container.widget().clone();
+                stack.add_named(&root, Some(&format!("ws-{id}")));
+                let row = gtk::ListBoxRow::new();
+                let indicator_button = gtk::Button::new();
+                sidebar_list.append(&row);
+                indicator_box.append(&indicator_button);
+
+                // Simulate GTK's synchronous gdk_drop_finish -> DragSource::drag-end callback
+                // firing inside gtk_list_box_remove -> gtk_widget_unparent when a dragged row is removed.
+                let state_for_signal = state.clone();
+                let count_for_signal = reentrant_borrows.clone();
+                row.connect_parent_notify(move |r| {
+                    if r.parent().is_none() {
+                        // Must be able to mutably borrow state without RefCell double-borrow panic!
+                        let mut s = state_for_signal.borrow_mut();
+                        s.workspace_dragging = None;
+                        count_for_signal.set(count_for_signal.get() + 1);
+                    }
+                });
+
+                Workspace {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    root: root.upcast(),
+                    split_container,
+                    sidebar_row: row,
+                    name_label: gtk::Label::new(Some(name)),
+                    favorite_button: gtk::Button::new(),
+                    notify_dot: gtk::Label::new(Some("•")),
+                    notify_label: gtk::Label::new(None),
+                    unread: false,
+                    manual_unread: false,
+                    favorite: false,
+                    color: None,
+                    cwd: Rc::new(RefCell::new(None)),
+                    folder_path: None,
+                    autostart_command: Rc::new(RefCell::new(None)),
+                    path_label: gtk::Label::new(None),
+                    indicator_button,
+                    indicator_unread_dot: gtk::Label::new(Some("•")),
+                }
+            };
+
+            let ws0 = make_ws("ws-0", "Workspace 0");
+            let ws1 = make_ws("ws-1", "Workspace 1");
+            state.borrow_mut().workspaces = vec![ws0, ws1];
+
+            // 1. Reordering workspaces must not hold state.borrow_mut() across sidebar_list.remove().
+            assert!(reorder_workspace_by_id(&state, "ws-0", "ws-1", true));
+            assert!(reentrant_borrows.get() >= 2);
+            assert_eq!(state.borrow().workspace_dragging, None);
+
+            // 2. Toggling favorite must not hold state.borrow_mut() across sidebar_list.remove().
+            toggle_workspace_favorite(&state, "ws-0");
+            assert!(state.borrow().workspaces[0].favorite);
+
+            // 3. Closing workspace must not hold state.borrow_mut() across sidebar_list.remove().
+            close_workspace_by_id(&state, "ws-0");
+            assert_eq!(state.borrow().workspaces.len(), 1);
+        });
     }
 }
 

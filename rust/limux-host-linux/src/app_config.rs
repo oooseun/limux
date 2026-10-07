@@ -86,6 +86,80 @@ pub struct AppConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub keep_open_after_last_terminal_closes: bool,
+    pub prompt_for_folder_on_create: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnreadColor {
+    #[default]
+    Amber,
+    Emerald,
+    Rose,
+    Cyan,
+    AccentBlue,
+}
+
+impl UnreadColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amber => "amber",
+            Self::Emerald => "emerald",
+            Self::Rose => "rose",
+            Self::Cyan => "cyan",
+            Self::AccentBlue => "accent_blue",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "amber" => Some(Self::Amber),
+            "emerald" => Some(Self::Emerald),
+            "rose" => Some(Self::Rose),
+            "cyan" => Some(Self::Cyan),
+            "accent_blue" => Some(Self::AccentBlue),
+            _ => None,
+        }
+    }
+
+    pub fn css_color(self) -> &'static str {
+        match self {
+            Self::Amber => "#f59e0b",
+            Self::Emerald => "#10b981",
+            Self::Rose => "#f43f5e",
+            Self::Cyan => "#06b6d4",
+            Self::AccentBlue => "@accent_bg_color",
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &[
+            "Amber (Default)",
+            "Emerald",
+            "Rose",
+            "Cyan",
+            "Accent Blue",
+        ]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Amber => 0,
+            Self::Emerald => 1,
+            Self::Rose => 2,
+            Self::Cyan => 3,
+            Self::AccentBlue => 4,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Emerald,
+            2 => Self::Rose,
+            3 => Self::Cyan,
+            4 => Self::AccentBlue,
+            _ => Self::Amber,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +168,7 @@ pub struct AppearanceConfig {
     pub ghostty_color_scheme: ColorScheme,
     pub ui_scale: UiScale,
     pub show_workspace_path: bool,
+    pub unread_color: UnreadColor,
 }
 
 impl Default for AppearanceConfig {
@@ -103,6 +178,7 @@ impl Default for AppearanceConfig {
             ghostty_color_scheme: ColorScheme::default(),
             ui_scale: UiScale::default(),
             show_workspace_path: true,
+            unread_color: UnreadColor::default(),
         }
     }
 }
@@ -409,9 +485,19 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let unread_color = appearance
+        .and_then(|appearance| appearance.get("unread_color"))
+        .and_then(Value::as_str)
+        .and_then(UnreadColor::from_str)
+        .unwrap_or_default();
+
     let workspace = root.get("workspace").and_then(Value::as_object);
     let keep_open_after_last_terminal_closes = workspace
         .and_then(|workspace| workspace.get("keep_open_after_last_terminal_closes"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    let prompt_for_folder_on_create = workspace
+        .and_then(|workspace| workspace.get("prompt_for_folder_on_create"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
 
@@ -475,9 +561,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             ghostty_color_scheme,
             ui_scale,
             show_workspace_path,
+            unread_color,
         },
         workspace: WorkspaceConfig {
             keep_open_after_last_terminal_closes,
+            prompt_for_folder_on_create,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -527,6 +615,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.appearance.ui_scale.get()),
         );
     }
+    if config.appearance.unread_color != UnreadColor::default() {
+        appearance.insert(
+            "unread_color".to_string(),
+            json!(config.appearance.unread_color.as_str()),
+        );
+    }
     root.insert("appearance".to_string(), Value::Object(appearance));
     root.insert(
         "focus".to_string(),
@@ -538,6 +632,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "keep_open_after_last_terminal_closes": config
                 .workspace
                 .keep_open_after_last_terminal_closes,
+            "prompt_for_folder_on_create": config
+                .workspace
+                .prompt_for_folder_on_create,
         }),
     );
     root.insert(
@@ -681,7 +778,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "hover_terminal_focus": false
         },
         "workspace": {
-            "keep_open_after_last_terminal_closes": false
+            "keep_open_after_last_terminal_closes": false,
+            "prompt_for_folder_on_create": false
         },
         "notifications": {
             "enabled": true,
