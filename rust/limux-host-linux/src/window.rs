@@ -26,6 +26,7 @@ use crate::shortcut_config::{
     self, EditableCapturePolicy, ResolvedShortcutConfig, ShortcutCommand, ShortcutId,
 };
 use crate::split_tree::{self, SplitTreeContainer};
+use crate::workspace_color::{self, WorkspaceColor};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
@@ -57,6 +58,8 @@ struct Workspace {
     manual_unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
+    /// Background colour of the sidebar row, if the user picked one.
+    color: Option<WorkspaceColor>,
     /// Last known working directory from the terminal (via OSC 7).
     cwd: Rc<RefCell<Option<String>>>,
     /// The folder path this workspace was opened with.
@@ -263,6 +266,7 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
         "selected": index == selected_idx,
         "focused": index == selected_idx,
         "cwd": cwd,
+        "color": workspace.color.map(WorkspaceColor::as_str),
     })
 }
 
@@ -274,6 +278,7 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "workspace": workspace_row(index, state.active_idx, workspace),
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
+        "color": workspace.color.map(WorkspaceColor::as_str),
     }))
 }
 
@@ -1220,6 +1225,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 cwd,
                 folder_path,
                 autostart_command: workspace.autostart_command.borrow().clone(),
+                color: workspace.color,
                 layout,
             }
         })
@@ -1319,7 +1325,10 @@ pub(crate) fn apply_ratio_value(
         return false;
     }
     applying.set(true);
-    paned.set_position(layout_state::split_position_from_ratio(ratio, size));
+    paned.set_position(crate::split_tree::clamp_paned_position(
+        paned,
+        layout_state::split_position_from_ratio(ratio, size),
+    ));
     update_split_ratio_state(paned, ratio);
     applying.set(false);
     true
@@ -1548,7 +1557,8 @@ const BASE_CSS: &str = r#"
     background: alpha(@window_fg_color, 0.05);
 }
 .limux-sidebar-list row:selected .limux-sidebar-row-box {
-    background: alpha(@accent_bg_color, 0.14);
+    background: alpha(@window_fg_color, 0.16);
+    box-shadow: inset 0 0 0 2px alpha(@window_fg_color, 0.9);
 }
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.65);
@@ -1747,13 +1757,15 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         ""
     };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css(background_opacity),
         pane::PANE_CSS,
+        crate::terminal::CLIPBOARD_TOAST_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
         crate::settings_editor::SETTINGS_CSS,
         crate::settings_editor::ui_scale_css(config),
         ssd_css,
+        workspace_color::workspace_color_css(),
     )
 }
 
@@ -1799,6 +1811,13 @@ pub fn build_window(app: &adw::Application) {
         &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let swatch_provider = gtk::CssProvider::new();
+    swatch_provider.load_from_data(workspace_color::SWATCH_BUTTON_CSS);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &swatch_provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 
     let style_manager = adw::StyleManager::default();
@@ -4207,12 +4226,79 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     menu_box.append(&new_tab_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
+
+    let current_color = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.color)
+    };
+    let swatch_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    swatch_row.set_margin_top(4);
+    swatch_row.set_margin_bottom(4);
+    swatch_row.set_halign(gtk::Align::Center);
+    // "No color" comes first, then the palette.
+    let swatches: Vec<(Option<WorkspaceColor>, gtk::Button)> = std::iter::once(None)
+        .chain(WorkspaceColor::ALL.into_iter().map(Some))
+        .map(|color| {
+            // The colour is painted on the label, not the button: see the
+            // swatch rules in `workspace_color`.
+            let dot = gtk::Label::new(Some(if current_color == color {
+                "\u{2713}"
+            } else {
+                ""
+            }));
+            dot.add_css_class(workspace_color::SWATCH_CSS_CLASS);
+            let swatch = gtk::Button::new();
+            swatch.set_child(Some(&dot));
+            swatch.add_css_class("flat");
+            swatch.add_css_class(workspace_color::SWATCH_BUTTON_CSS_CLASS);
+            match color {
+                Some(color) => {
+                    dot.add_css_class(&color.css_class());
+                    swatch.set_tooltip_text(Some(color.label()));
+                }
+                None => {
+                    dot.add_css_class(workspace_color::NO_COLOR_SWATCH_CSS_CLASS);
+                    swatch.set_tooltip_text(Some("No color"));
+                }
+            }
+            swatch.set_valign(gtk::Align::Center);
+            swatch_row.append(&swatch);
+            (color, swatch)
+        })
+        .collect();
+    menu_box.append(&swatch_row);
+
     menu_box.append(&delete_btn);
 
     let popover = gtk::Popover::new();
     popover.set_child(Some(&menu_box));
     popover.set_parent(row);
     popover.set_position(gtk::PositionType::Right);
+    // Until the menu has a size, GTK's pointer pick lands on its last button
+    // and leaves "Delete" looking hovered. Take pointer input only once laid out.
+    menu_box.set_can_target(false);
+    menu_box.add_tick_callback(|menu_box, _| {
+        if menu_box.width() > 0 {
+            menu_box.set_can_target(true);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+
+    for (color, button) in swatches {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
+        button.connect_clicked(move |_| {
+            pop.popdown();
+            set_workspace_color(&state, &ws_id, color);
+        });
+    }
 
     let absorb_click = gtk::GestureClick::new();
     absorb_click.set_button(0);
@@ -4591,6 +4677,40 @@ fn set_workspace_favorite_visual(workspace: &Workspace) {
             .favorite_button
             .remove_css_class("limux-ws-star-btn-active");
     }
+}
+
+fn set_workspace_color_visual(workspace: &Workspace) {
+    let Some(row_box) = workspace.sidebar_row.child() else {
+        return;
+    };
+    for color in WorkspaceColor::ALL {
+        row_box.remove_css_class(&color.css_class());
+    }
+    match workspace.color {
+        Some(color) => {
+            row_box.add_css_class(workspace_color::COLORED_ROW_CSS_CLASS);
+            row_box.add_css_class(&color.css_class());
+        }
+        None => row_box.remove_css_class(workspace_color::COLORED_ROW_CSS_CLASS),
+    }
+}
+
+/// Set or clear a workspace's sidebar colour. Returns false for an unknown workspace.
+fn set_workspace_color(state: &State, workspace_id: &str, color: Option<WorkspaceColor>) -> bool {
+    {
+        let mut app_state = state.borrow_mut();
+        let Some(workspace) = app_state
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return false;
+        };
+        workspace.color = color;
+        set_workspace_color_visual(workspace);
+    }
+    request_session_save(state);
+    true
 }
 
 fn find_rename_entry_in_widget(widget: &gtk::Widget) -> Option<gtk::Entry> {
@@ -5022,6 +5142,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             unread: false,
             manual_unread: false,
             favorite: false,
+            color: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             autostart_command,
@@ -5582,6 +5703,7 @@ fn workspace_state_with_folder(name: &str, folder_path: &str) -> WorkspaceState 
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
         autostart_command: None,
+        color: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     }
 }
@@ -5968,6 +6090,30 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let app_state = state.borrow();
                 workspace_payload(&app_state, index)
             };
+            let _ = reply.send(result.ok_or_else(|| {
+                crate::control_bridge::BridgeError::not_found("workspace not found")
+            }));
+        }
+        ControlCommand::SetWorkspaceColor {
+            target,
+            color,
+            reply,
+        } => {
+            let workspace_id = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+                    .map(|index| app_state.workspaces[index].id.clone())
+            };
+            let result = workspace_id
+                .filter(|workspace_id| set_workspace_color(state, workspace_id, color))
+                .and_then(|workspace_id| {
+                    let app_state = state.borrow();
+                    let index = app_state
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == workspace_id)?;
+                    workspace_payload(&app_state, index)
+                });
             let _ = reply.send(result.ok_or_else(|| {
                 crate::control_bridge::BridgeError::not_found("workspace not found")
             }));
@@ -6405,6 +6551,7 @@ fn connect_ssh_target(state: &State, target: crate::ssh_hosts::SshTarget) {
         cwd: None,
         folder_path: None,
         autostart_command: None,
+        color: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(None)),
     };
     add_workspace_with_initial_command(state, &workspace, Some(target.command()));
@@ -6536,6 +6683,7 @@ fn add_workspace_with_initial_command(
         unread: false,
         manual_unread: false,
         favorite: workspace.favorite,
+        color: workspace.color,
         cwd,
         folder_path: workspace.folder_path.clone(),
         autostart_command,
@@ -6547,6 +6695,7 @@ fn add_workspace_with_initial_command(
     if workspace.favorite {
         set_workspace_favorite_visual(&ws);
     }
+    set_workspace_color_visual(&ws);
 
     {
         let mut s = state.borrow_mut();
@@ -6789,7 +6938,6 @@ fn close_workspace_by_id_internal(
     let Some(split_container) = split_container else {
         return;
     };
-    split_container.retire_panes();
 
     let mut s = state.borrow_mut();
     let Some(idx) = s.workspaces.iter().position(|workspace| workspace.id == id) else {
@@ -6808,6 +6956,7 @@ fn close_workspace_by_id_internal(
         drop(s);
         sidebar_list.remove(&ws.sidebar_row);
         indicator_box.remove(&ws.indicator_button);
+        split_container.retire_panes();
         crate::terminal::remove_from_stack_after_repaint(&ws.root);
         apply_top_bar_mode(state);
         if persist {
@@ -6844,6 +6993,10 @@ fn close_workspace_by_id_internal(
     // and the crossing event it sends to the terminal under the pointer reads
     // the state, so it runs without the borrow.
     stack.set_visible_child_name(&stack_name);
+    // The switch moves the focus into the new workspace when the old one had
+    // it, so the old one is retired only now: retiring unsets a focus inside
+    // it (see `terminal::unset_focus_within`).
+    split_container.retire_panes();
     crate::terminal::remove_from_stack_after_repaint(&ws.root);
     sidebar_list.select_row(Some(&row));
     apply_top_bar_mode(state);
@@ -10311,6 +10464,7 @@ mod tests {
                     unread: false,
                     manual_unread: false,
                     favorite: false,
+                    color: None,
                     cwd: Rc::new(RefCell::new(None)),
                     folder_path: None,
                     autostart_command: Rc::new(RefCell::new(None)),
@@ -10702,6 +10856,7 @@ mod tests {
                     unread: false,
                     manual_unread: false,
                     favorite: false,
+                    color: None,
                     cwd: Rc::new(RefCell::new(None)),
                     folder_path: None,
                     autostart_command: Rc::new(RefCell::new(None)),
@@ -10742,3 +10897,7 @@ mod tab_move_tests;
 #[cfg(test)]
 #[path = "pane_create_tests.rs"]
 mod pane_create_tests;
+
+#[cfg(test)]
+#[path = "pane_close_tests.rs"]
+mod pane_close_tests;
