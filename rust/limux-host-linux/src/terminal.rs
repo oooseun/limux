@@ -43,7 +43,12 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static CURRENT_COMMAND_ACCEPTS_SHELL_INPUT: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
+static SUPPRESS_REALIZE_FOCUS: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
+
+pub fn set_suppress_realize_focus(suppress: bool) {
+    SUPPRESS_REALIZE_FOCUS.store(suppress, Ordering::Relaxed);
+}
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -1923,18 +1928,13 @@ pub fn create_terminal(
             display_realized.adopt_realized();
             *surface_cell.borrow_mut() = Some(surface);
 
-            let is_mapped = gl_area.is_mapped();
-            if is_mapped {
-                // Grab GTK focus so key events reach this widget when mapped.
-                request_terminal_focus(gl_area, &had_focus);
-            }
-            gl_area.set_auto_render(is_mapped);
+            let suppress_focus = SUPPRESS_REALIZE_FOCUS.load(Ordering::Relaxed);
             unsafe {
-                ghostty_surface_set_occlusion(surface, is_mapped);
-                ghostty_surface_set_focus(
-                    surface,
-                    is_mapped && (gl_area.is_focus() || had_focus.get()),
-                );
+                ghostty_surface_set_focus(surface, !suppress_focus);
+            }
+            if !suppress_focus {
+                // Grab GTK focus so key events reach this widget.
+                request_terminal_focus(gl_area, &had_focus);
             }
         });
         track_signal(&signal_handlers, &gl_area, handler);

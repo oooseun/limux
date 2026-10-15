@@ -2394,11 +2394,48 @@ pub fn build_window(app: &adw::Application) {
     }
 }
 
+const GTK4_14_HOST_ENTRY_CSS: &str = r#"
+.limux-host-entry {
+    background-color: alpha(@window_bg_color, 0.98);
+    color: alpha(@window_fg_color, 0.96);
+    border: 1px solid alpha(@window_fg_color, 0.16);
+    border-radius: 6px;
+    caret-color: currentColor;
+}
+.limux-host-entry:focus-within {
+    border-color: alpha(@accent_bg_color, 0.75);
+}
+.limux-host-entry text {
+    background-color: transparent;
+    color: alpha(@window_fg_color, 0.96);
+}
+.limux-host-entry text placeholder {
+    color: alpha(@window_fg_color, 0.5);
+}
+.limux-host-entry image {
+    color: alpha(@window_fg_color, 0.5);
+}
+"#;
+
+fn base_css_for_runtime_gtk() -> std::borrow::Cow<'static, str> {
+    if (gtk::major_version(), gtk::minor_version()) >= (4, 16) {
+        return std::borrow::Cow::Borrowed(BASE_CSS);
+    }
+    if let Some((_, rest)) = BASE_CSS.split_once("/* ---------- Top bar") {
+        std::borrow::Cow::Owned(format!(
+            "{GTK4_14_HOST_ENTRY_CSS}\n/* ---------- Top bar{rest}"
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(BASE_CSS)
+    }
+}
+
 fn build_window_css(background_opacity: f64) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
     let (r, g, b) = CONTENT_BACKGROUND_RGB;
+    let base_css = base_css_for_runtime_gtk();
     format!(
-        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+        "{base_css}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
     )
 }
 
@@ -4214,8 +4251,8 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
-    menu_box.append(&unread_btn);
     menu_box.append(&new_tab_btn);
+    menu_box.append(&unread_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&autostart_btn);
 
@@ -5351,12 +5388,10 @@ fn install_workspace_row_interactions(
 }
 
 fn add_workspace(state: &State, working_directory: Option<&str>) {
-    let prompt_for_folder = state
-        .borrow()
-        .config
-        .borrow()
-        .workspace
-        .prompt_for_folder_on_create;
+    let prompt_for_folder = {
+        let s = state.borrow();
+        s.workspaces.is_empty() || s.config.borrow().workspace.prompt_for_folder_on_create
+    };
     if prompt_for_folder {
         show_workspace_path_dialog(state);
         return;
@@ -6972,9 +7007,12 @@ fn run_startup_eager_restore(state: &State) {
                 }
                 let active = pane::active_tab_id_in_pane(&pane);
                 for tab_id in tab_ids {
-                    // The active tab realizes with its workspace; visiting the
-                    // workspace at all is what it needs.
-                    if active.as_deref() == Some(tab_id.as_str()) {
+                    // Active tabs in the initial workspace are already mapped
+                    // and realized; non-active workspaces need every tab
+                    // visited for at least one tick so multi-tab panes do not
+                    // immediately switch away from their active tab before
+                    // GTK maps it.
+                    if workspace_idx == original_idx && active.as_deref() == Some(tab_id.as_str()) {
                         continue;
                     }
                     steps.push(EagerRestoreStep {
@@ -6987,19 +7025,6 @@ fn run_startup_eager_restore(state: &State) {
                     restore.push((pane.clone(), active));
                 }
             }
-            // Guarantee at least one visit per workspace, so single-tab panes
-            // in never-opened workspaces still spawn their agents.
-            if !steps.iter().any(|step| step.workspace_idx == workspace_idx) {
-                if let Some(pane) = workspace.split_container.panes().into_iter().next() {
-                    if let Some(active) = pane::active_tab_id_in_pane(&pane) {
-                        steps.push(EagerRestoreStep {
-                            workspace_idx,
-                            pane,
-                            tab_id: active,
-                        });
-                    }
-                }
-            }
         }
     }
 
@@ -7009,6 +7034,9 @@ fn run_startup_eager_restore(state: &State) {
 
     let total = steps.len();
     eprintln!("limux: startup eager restore sweeping {total} tabs");
+
+    let saved_focus = gtk::prelude::GtkWindowExt::focus(&state.borrow().window);
+    crate::terminal::set_suppress_realize_focus(true);
 
     let steps = Rc::new(steps);
     let restore = Rc::new(restore);
@@ -7022,19 +7050,40 @@ fn run_startup_eager_restore(state: &State) {
 
             if index >= steps.len() {
                 for (pane, tab_id) in restore.iter() {
-                    pane::activate_tab_in_pane(pane, tab_id);
+                    pane::realize_tab_in_pane_quietly(pane, tab_id);
                 }
-                select_workspace_by_index(&state, original_idx);
+                let focus_root = {
+                    let app_state = state.borrow();
+                    let active_idx = original_idx.min(app_state.workspaces.len().saturating_sub(1));
+                    app_state.workspaces.get(active_idx).map(|ws| {
+                        let stack_name = format!("ws-{}", ws.id);
+                        app_state.stack.set_visible_child_name(&stack_name);
+                        ws.root.clone()
+                    })
+                };
+                crate::terminal::set_suppress_realize_focus(false);
+                if let Some(root) = focus_root {
+                    let restored_focus = saved_focus
+                        .as_ref()
+                        .filter(|widget| widget.is_ancestor(&root) && widget.is_mapped())
+                        .is_some_and(|widget| widget.grab_focus());
+                    if !restored_focus {
+                        focus_workspace_entrypoint(&root);
+                    }
+                }
                 eprintln!("limux: startup eager restore complete ({total} tabs)");
                 return glib::ControlFlow::Break;
             }
 
             let step = &steps[index];
-            let current_idx = state.borrow().active_idx;
-            if current_idx != step.workspace_idx {
-                select_workspace_by_index(&state, step.workspace_idx);
+            {
+                let app_state = state.borrow();
+                if let Some(ws) = app_state.workspaces.get(step.workspace_idx) {
+                    let stack_name = format!("ws-{}", ws.id);
+                    app_state.stack.set_visible_child_name(&stack_name);
+                }
             }
-            pane::activate_tab_in_pane(&step.pane, &step.tab_id);
+            pane::realize_tab_in_pane_quietly(&step.pane, &step.tab_id);
 
             cursor.set(index + 1);
             glib::ControlFlow::Continue
@@ -7520,20 +7569,22 @@ fn handle_split_with_tab(
 /// Find the focused pane widget (a gtk::Box with class limux-pane-toolbar child)
 /// by walking up from the currently focused widget.
 fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
-    let (ws_id, stack) = {
+    let (ws_id, ws_root, stack) = {
         let s = state.borrow();
         let ws = s.active_workspace()?;
-        (ws.id.clone(), s.stack.clone())
+        (ws.id.clone(), ws.root.clone(), s.stack.clone())
     };
 
     // Get the window's focus widget and walk up to find a pane Box
     let window = stack.root()?.downcast::<gtk::Window>().ok()?;
     let focus = gtk::prelude::GtkWindowExt::focus(&window)?;
 
-    // A closed pane keeps the focus until its teardown frame: skip it.
+    // A closed pane keeps the focus until its teardown frame, and an unmapped
+    // workspace page can still hold window.focus(): require the pane to belong
+    // to the active workspace's widget tree.
     let mut widget: Option<gtk::Widget> = Some(focus);
     while let Some(w) = widget {
-        if pane::is_live_pane(&w) {
+        if pane::is_live_pane(&w) && w.is_ancestor(&ws_root) {
             return Some((ws_id, w));
         }
         widget = w.parent();
